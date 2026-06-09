@@ -367,6 +367,11 @@ python -X utf8 run_all_strategies.py SH 600519 --count 2000 --cash 1000000 --adj
   <sub>SH601179 中国西电 — expma_cross 策略 | 收益 168.0%</sub>
 </p>
 
+<p align="center">
+  <img src="strategies/demo/4.png" width="700"><br>
+  <sub>SH600519 贵州茅台 — bollinger_breakout 策略 | 收益 187.0%</sub>
+</p>
+
 > **⚠️ Demo 展示，不作为操作依据。** 历史回测收益不代表未来表现，策略参数未经过样本外验证。
 
 #### 自带策略示例
