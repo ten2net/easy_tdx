@@ -212,6 +212,49 @@ def test_serve_command_exists():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Regression: input validation (case-insensitive + invalid → ValueError → 400)
+# ---------------------------------------------------------------------------
+
+
+def test_convert_market_lowercase():
+    """market_from_str should accept lowercase input."""
+    pytest.importorskip("fastapi")
+    from easy_tdx.models.enums import Market
+    from easy_tdx.web.convert import market_from_str
+
+    assert market_from_str("sz") == Market.SZ
+    assert market_from_str("sh") == Market.SH
+    assert market_from_str("Bj") == Market.BJ
+
+
+def test_convert_market_invalid_raises_valueerror():
+    """market_from_str should raise ValueError for invalid market codes."""
+    pytest.importorskip("fastapi")
+    from easy_tdx.web.convert import market_from_str
+
+    with pytest.raises(ValueError, match="无效市场代码"):
+        market_from_str("ZZZ")
+
+
+def test_convert_category_from_int_string():
+    """category_from_str should accept numeric string like '4'."""
+    pytest.importorskip("fastapi")
+    from easy_tdx.models.enums import KlineCategory
+    from easy_tdx.web.convert import category_from_str
+
+    assert category_from_str("4") == KlineCategory.DAY
+
+
+def test_convert_category_invalid_raises_valueerror():
+    """category_from_str should raise ValueError for invalid period."""
+    pytest.importorskip("fastapi")
+    from easy_tdx.web.convert import category_from_str
+
+    with pytest.raises(ValueError, match="无效K线周期"):
+        category_from_str("INVALID_PERIOD")
+
+
 def test_full_app_routes_registered():
     """All routers should be mounted and accessible."""
     pytest.importorskip("fastapi")

@@ -6,16 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
+from easy_tdx.web.convert import market_from_str
 from easy_tdx.web.deps import get_client
 from easy_tdx.web.schemas import DataFrameResponse
 
 router = APIRouter(tags=["finance"])
-
-
-def _market(market: str) -> Any:
-    from easy_tdx.models.enums import Market
-
-    return Market[market.upper()]
 
 
 def _df_resp(df: Any) -> DataFrameResponse:
@@ -29,7 +24,7 @@ async def xdxr_info(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取除权除息历史记录。"""
-    df = await client.get_xdxr_info(_market(market), code)
+    df = await client.get_xdxr_info(market_from_str(market), code)
     return _df_resp(df)
 
 
@@ -40,7 +35,7 @@ async def finance_info(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取最新财务数据。"""
-    df = await client.get_finance_info(_market(market), code)
+    df = await client.get_finance_info(market_from_str(market), code)
     return _df_resp(df)
 
 
@@ -51,7 +46,7 @@ async def company_info_category(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取公司信息文件目录。"""
-    df = await client.get_company_info_category(_market(market), code)
+    df = await client.get_company_info_category(market_from_str(market), code)
     return _df_resp(df)
 
 
@@ -65,7 +60,9 @@ async def company_info_content(
     client: Any = Depends(get_client),
 ) -> dict[str, str]:
     """读取公司信息文本。"""
-    content = await client.get_company_info_content(_market(market), code, filename, offset, length)
+    content = await client.get_company_info_content(
+        market_from_str(market), code, filename, offset, length
+    )
     return {"content": content}
 
 

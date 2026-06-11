@@ -6,22 +6,15 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
+from easy_tdx.web.convert import market_from_str
 from easy_tdx.web.deps import get_client
 from easy_tdx.web.schemas import (
     CountResponse,
     DataFrameResponse,
-    MarketEnum,
     QuoteRequest,
 )
 
 router = APIRouter(tags=["market"])
-
-
-def _market_from_str(s: str) -> Any:
-    """将字符串转为 Market 枚举。"""
-    from easy_tdx.models.enums import Market
-
-    return Market[MarketEnum[s].name]
 
 
 def _df_response(df: Any) -> DataFrameResponse:
@@ -35,7 +28,7 @@ async def security_count(
     client: Any = Depends(get_client),
 ) -> CountResponse:
     """获取市场证券总数。"""
-    count = await client.get_security_count(_market_from_str(market))
+    count = await client.get_security_count(market_from_str(market))
     return CountResponse(count=count)
 
 
@@ -46,7 +39,7 @@ async def security_list(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取证券列表（每页约1000条）。"""
-    df = await client.get_security_list(_market_from_str(market), start)
+    df = await client.get_security_list(market_from_str(market), start)
     return _df_response(df)
 
 
@@ -66,11 +59,9 @@ async def security_quotes(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """批量获取实时五档行情（最多80只/次）。"""
-    from easy_tdx.models.enums import Market
-
     stocks_parsed: list[tuple[Any, str]] = []
     for s in req.stocks:
-        m = Market[MarketEnum[s.market].name]
+        m = market_from_str(s.market)
         stocks_parsed.append((m, s.code))
     df = await client.get_security_quotes(stocks_parsed)
     return _df_response(df)
@@ -92,7 +83,7 @@ async def fund_flow(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取个股当日资金流向。"""
-    df = await client.get_fund_flow(_market_from_str(market), code)
+    df = await client.get_fund_flow(market_from_str(market), code)
     return _df_response(df)
 
 
@@ -105,5 +96,5 @@ async def history_fund_flow(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取个股历史日线资金流向。"""
-    df = await client.get_history_fund_flow(_market_from_str(market), code, start, count)
+    df = await client.get_history_fund_flow(market_from_str(market), code, start, count)
     return _df_response(df)

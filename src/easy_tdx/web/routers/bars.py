@@ -6,26 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
+from easy_tdx.web.convert import category_from_str, market_from_str
 from easy_tdx.web.deps import get_client
-from easy_tdx.web.schemas import DataFrameResponse, KlineCategoryEnum
+from easy_tdx.web.schemas import DataFrameResponse
 
 router = APIRouter(tags=["bars"])
-
-
-def _market(market: str) -> Any:
-    from easy_tdx.models.enums import Market
-
-    return Market[market.upper()]
-
-
-def _category(category: str) -> Any:
-    from easy_tdx.models.enums import KlineCategory
-
-    # Support both int and string name
-    try:
-        return KlineCategory(int(category))
-    except (ValueError, TypeError):
-        return KlineCategory[KlineCategoryEnum[category.upper()].name]
 
 
 def _df_resp(df: Any) -> DataFrameResponse:
@@ -45,7 +30,9 @@ async def security_bars(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取股票K线数据。"""
-    df = await client.get_security_bars(_market(market), code, _category(category), start, count)
+    df = await client.get_security_bars(
+        market_from_str(market), code, category_from_str(category), start, count
+    )
     return _df_resp(df)
 
 
@@ -59,7 +46,9 @@ async def index_bars(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取指数K线数据。"""
-    df = await client.get_index_bars(_market(market), code, _category(category), start, count)
+    df = await client.get_index_bars(
+        market_from_str(market), code, category_from_str(category), start, count
+    )
     return _df_resp(df)
 
 
@@ -70,7 +59,7 @@ async def minute_time(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取今日分时数据。"""
-    df = await client.get_minute_time_data(_market(market), code)
+    df = await client.get_minute_time_data(market_from_str(market), code)
     return _df_resp(df)
 
 
@@ -82,7 +71,7 @@ async def history_minute_time(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取历史某日分时数据。"""
-    df = await client.get_history_minute_time_data(_market(market), code, date)
+    df = await client.get_history_minute_time_data(market_from_str(market), code, date)
     return _df_resp(df)
 
 
@@ -95,7 +84,7 @@ async def transaction_data(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取当日逐笔成交。"""
-    df = await client.get_transaction_data(_market(market), code, start, count)
+    df = await client.get_transaction_data(market_from_str(market), code, start, count)
     return _df_resp(df)
 
 
@@ -109,5 +98,7 @@ async def history_transaction_data(
     client: Any = Depends(get_client),
 ) -> DataFrameResponse:
     """获取历史逐笔成交。"""
-    df = await client.get_history_transaction_data(_market(market), code, date, start, count)
+    df = await client.get_history_transaction_data(
+        market_from_str(market), code, date, start, count
+    )
     return _df_resp(df)

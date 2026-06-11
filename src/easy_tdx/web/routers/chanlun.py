@@ -6,25 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 
+from easy_tdx.web.convert import category_from_str, market_from_str
 from easy_tdx.web.deps import get_client
 from easy_tdx.web.schemas import ChanlunRequest
 
 router = APIRouter(tags=["chanlun"])
-
-
-def _market(market: str) -> Any:
-    from easy_tdx.models.enums import Market
-
-    return Market[market.upper()]
-
-
-def _category(category: str) -> Any:
-    from easy_tdx.models.enums import KlineCategory
-
-    try:
-        return KlineCategory(int(category))
-    except (ValueError, TypeError):
-        return KlineCategory[category.upper()]
 
 
 @router.post("/chanlun/analyze")
@@ -41,7 +27,11 @@ async def chanlun_analyze(
 
     # 1. Fetch kline data
     df = await client.get_security_bars(
-        _market(req.market), req.code, _category(req.category), req.start, req.count
+        market_from_str(req.market),
+        req.code,
+        category_from_str(req.category),
+        req.start,
+        req.count,
     )
 
     # 2. Run chanlun analysis
