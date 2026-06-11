@@ -29,6 +29,7 @@ from .cmd_quote import quote, quote_list
 from .cmd_run_all import run_all
 from .cmd_tick import tick
 from .cmd_transaction import transaction
+from .cmd_web import serve
 
 
 @click.group()
@@ -84,3 +85,4 @@ cli.add_command(backtest)
 cli.add_command(portfolio)
 cli.add_command(run_all)
 cli.add_command(screen)
+cli.add_command(serve)
