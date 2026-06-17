@@ -629,6 +629,59 @@ class TestChanlunAnalyser:
             assert date_re.match(bc["curr_date"])
             assert date_re.match(bc["prev_date"])
 
+    def test_result_to_dict_minute_frequency_includes_time(self) -> None:
+        """分钟级别 frequency 下，日期字段应输出完整时分 YYYY-MM-DD HH:MM。
+
+        对应网友反馈：分钟/低级别也需要时分用于分时可视化。
+        覆盖 CLI 原始值（5MIN/30MIN）与 Web 映射值（5min/30min）两种大小写。
+        """
+        import math
+        import re
+
+        import pandas as pd
+
+        from easy_tdx.chanlun.analyser import ChanlunAnalyser
+
+        dates = pd.date_range("2025-01-02 09:30", periods=60, freq="5min")
+        highs = [15 + 5 * math.sin(i / 2) + i * 0.01 for i in range(60)]
+        lows = [highs[i] - 1.5 for i in range(60)]
+        df = pd.DataFrame(
+            {
+                "datetime": dates,
+                "open": [h - 0.5 for h in highs],
+                "close": [h - 0.2 for h in highs],
+                "high": highs,
+                "low": lows,
+                "vol": [1000] * 60,
+            }
+        )
+        datetime_re = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+        # CLI 原始值（大写 5MIN）与 Web 映射值（小写 5min）应行为一致
+        for freq in ("5MIN", "5min"):
+            d = ChanlunAnalyser(code="SZ000001", frequency=freq).process_klines(df).to_dict()
+
+            # bis 日期应带时分
+            assert len(d["bis"]) > 0
+            for bi in d["bis"]:
+                assert datetime_re.match(bi["start_date"])
+                assert datetime_re.match(bi["end_date"])
+
+            # zss/mmds/bcs 若产出，同样应带时分（有就检查）
+            for zs in d["zss"]:
+                if zs["start_date"] is not None:
+                    assert datetime_re.match(zs["start_date"])
+                if zs["end_date"] is not None:
+                    assert datetime_re.match(zs["end_date"])
+            for mmd in d["mmds"]:
+                if mmd["date"] is not None:
+                    assert datetime_re.match(mmd["date"])
+            for bc in d["bcs"]:
+                if bc["curr_date"] is not None:
+                    assert datetime_re.match(bc["curr_date"])
+                if bc["prev_date"] is not None:
+                    assert datetime_re.match(bc["prev_date"])
+
     def test_print_table_with_dates(self) -> None:
         """CLI table 模式应正确消费 zss/mmds/bcs 的日期字段。
 

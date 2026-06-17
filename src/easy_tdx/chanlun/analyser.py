@@ -8,6 +8,7 @@ K线合并 → 分型识别 → 笔计算 → 中枢计算 → 线段 → 买卖
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -66,6 +67,17 @@ class ChanlunResult:
     bcs: list[BC] = field(default_factory=list)
     macd: dict[str, list[float]] = field(default_factory=dict)
 
+    def _fmt_dt(self, dt: datetime) -> str:
+        """按 frequency 自适应格式化日期。
+
+        分钟级别（1/5/15/30/60min）输出完整时分 YYYY-MM-DD HH:MM，
+        日/周/月/年级别只输出日期 YYYY-MM-DD（无多余 00:00）。
+        frequency 来自 CLI 原始值（如 5MIN/30MIN）或 Web 映射值（5min/30min），
+        统一转小写后判断是否含 'min'。
+        """
+        fmt = "%Y-%m-%d %H:%M" if "min" in self.frequency.lower() else "%Y-%m-%d"
+        return dt.strftime(fmt)
+
     def to_dict(self) -> dict[str, Any]:
         """将结果转为可序列化的字典（用于 JSON 输出）。"""
         return {
@@ -83,8 +95,8 @@ class ChanlunResult:
                 {
                     "index": bi.index,
                     "direction": bi.direction.value,
-                    "start_date": bi.start.k.date.strftime("%Y-%m-%d"),
-                    "end_date": bi.end.k.date.strftime("%Y-%m-%d"),
+                    "start_date": self._fmt_dt(bi.start.k.date),
+                    "end_date": self._fmt_dt(bi.end.k.date),
                     "high": round(bi.high, 2),
                     "low": round(bi.low, 2),
                     "done": bi.is_done(),
@@ -99,8 +111,8 @@ class ChanlunResult:
                     "gg": round(zs.gg, 2),
                     "dd": round(zs.dd, 2),
                     "line_count": zs.line_count,
-                    "start_date": zs.start.k.date.strftime("%Y-%m-%d") if zs.start else None,
-                    "end_date": zs.end.k.date.strftime("%Y-%m-%d") if zs.end else None,
+                    "start_date": self._fmt_dt(zs.start.k.date) if zs.start else None,
+                    "end_date": self._fmt_dt(zs.end.k.date) if zs.end else None,
                     "done": zs.done,
                 }
                 for zs in self.zss
@@ -109,8 +121,8 @@ class ChanlunResult:
                 {
                     "index": xd.index,
                     "direction": xd.direction.value,
-                    "start_date": xd.start.k.date.strftime("%Y-%m-%d"),
-                    "end_date": xd.end.k.date.strftime("%Y-%m-%d"),
+                    "start_date": self._fmt_dt(xd.start.k.date),
+                    "end_date": self._fmt_dt(xd.end.k.date),
                     "high": round(xd.high, 2),
                     "low": round(xd.low, 2),
                 }
@@ -119,7 +131,7 @@ class ChanlunResult:
             "mmds": [
                 {
                     "type": mmd.mmd_type.value,
-                    "date": mmd.bi.end.k.date.strftime("%Y-%m-%d") if mmd.bi else None,
+                    "date": self._fmt_dt(mmd.bi.end.k.date) if mmd.bi else None,
                     "msg": mmd.msg,
                 }
                 for mmd in self.mmds
@@ -128,8 +140,8 @@ class ChanlunResult:
                 {
                     "type": bc.bc_type.value,
                     "bc": bc.bc,
-                    "curr_date": bc.curr.end.k.date.strftime("%Y-%m-%d") if bc.curr else None,
-                    "prev_date": bc.prev.end.k.date.strftime("%Y-%m-%d") if bc.prev else None,
+                    "curr_date": self._fmt_dt(bc.curr.end.k.date) if bc.curr else None,
+                    "prev_date": self._fmt_dt(bc.prev.end.k.date) if bc.prev else None,
                     "msg": bc.msg,
                 }
                 for bc in self.bcs

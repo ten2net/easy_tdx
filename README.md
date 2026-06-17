@@ -1618,6 +1618,12 @@ ruff format --check src/ tests/                              # format check
 
 ## Changelog
 
+### 1.14.5 (2026-06-17)
+
+**缠论可视化日期自适应时分** — 响应网友反馈，分钟级别（1/5/15/30/60min）的缠论结果日期字段现在输出完整时分 `YYYY-MM-DD HH:MM`，日/周/月/年级别仍只输出日期 `YYYY-MM-DD`（无多余 `00:00`）。
+
+新增 `ChanlunResult._fmt_dt()` 按 `frequency` 自适应格式化，统一作用于 `bis` / `zss` / `mmds` / `bcs` / `xds` 所有日期字段。兼容 CLI 原始值（`5MIN`/`30MIN`）与 Web 映射值（`5min`/`30min`）的大小写。三层接入同步生效。
+
 ### 1.14.4 (2026-06-16)
 
 **CI 修复** — 修复 v1.14.3 中 `cmd_chanlun.py` 两处 `click.echo(...)` 未按 `ruff format` 行宽规则合并导致的 CI 格式检查失败（纯格式调整，无功能变化）。
