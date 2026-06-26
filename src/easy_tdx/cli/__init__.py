@@ -19,6 +19,7 @@ from .cmd_board import (
 )
 from .cmd_capital import capital_flow
 from .cmd_chanlun import chanlun
+from .cmd_company import company_info, company_info_content, finance_info
 from .cmd_ex import ex
 from .cmd_factor import factor
 from .cmd_finance import f10, fund_flow
@@ -80,6 +81,9 @@ cli.add_command(server_info)
 cli.add_command(symbol_info)
 cli.add_command(f10)
 cli.add_command(fund_flow)
+cli.add_command(finance_info)
+cli.add_command(company_info)
+cli.add_command(company_info_content)
 cli.add_command(ex)
 cli.add_command(indicator)
 cli.add_command(indicator_list)
