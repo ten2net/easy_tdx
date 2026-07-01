@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +35,8 @@ import pandas as pd
 from easy_tdx.backtest.engine import BacktestEngine
 from easy_tdx.backtest.strategy import Strategy
 from easy_tdx.backtest.types import BacktestResult
+
+logger = logging.getLogger(__name__)
 
 NDArray = np.ndarray
 BoolArray = npt.NDArray[np.bool_]
@@ -210,6 +213,14 @@ def combine_masks(
         return bool_array(np.any(buy_stack, axis=0)), bool_array(np.any(sell_stack, axis=0))
     elif mode == "MAJORITY":
         n_factors = len(signals_list)
+        # n_factors < 3 时 MAJORITY 退化为 AND/ANY（n=2 时 threshold=1.0，
+        # 需 >1.0 即两个都要，等价于 AND）。提醒用户明确指定模式（审计 #17）。
+        if n_factors < 3:
+            logger.warning(
+                "MAJORITY 模式在因子数 < 3 时（当前 %d）退化为 AND/ANY，"
+                "建议明确指定 mode='AND' 或 'OR' 以避免语义混淆",
+                n_factors,
+            )
         threshold = n_factors / 2
         return (
             bool_array(np.sum(buy_stack, axis=0) > threshold),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -253,6 +254,11 @@ def ex_daily(
 
     filepath = Path(filename)
     if not filepath.is_file():
+        # 路径穿越防护（审计 #16）：仅当 filename 是裸文件名（不含路径分隔符 / \ 与
+        # 父目录引用 ..）时，才允许拼接到 vipdoc 目录下，防止 "../foo" 写出目录之外。
+        # 允许通达信扩展行情文件名的常见字符（含 #，如 "29#A1801"、"12#A_IXIC"）。
+        if re.search(r"[\\/]|(\.\.)", filename):
+            raise click.BadParameter("filename 禁止包含路径分隔符(/ \\)或父目录引用(..)")
         tdx_home = detect_tdx_home()
         if tdx_home is not None:
             filepath = tdx_home / "vipdoc" / "ds" / "lday" / f"{filename}.day"

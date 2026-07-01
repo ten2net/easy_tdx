@@ -10,11 +10,14 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import time
 from pathlib import Path
 from typing import Any
 
 import click
+
+logger = logging.getLogger(__name__)
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────────────
 
@@ -31,6 +34,9 @@ def _load_strategy_class(file_path: Path) -> type | None:
     try:
         spec.loader.exec_module(module)
     except Exception:
+        # 策略文件可能有语法错误 / ImportError / 运行期异常，记录完整 traceback
+        # 而非静默吞掉，否则用户只看到"加载失败"却不知根因（审计 #6）。
+        logger.exception("策略文件加载失败: %s", file_path)
         return None
 
     for attr_name in dir(module):

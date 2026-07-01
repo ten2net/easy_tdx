@@ -197,8 +197,13 @@ self.sell(size=0)                             # 全部卖出
 |------|------|--------|------|
 | `size` | float | 0 | 交易数量，0 = 全仓/清仓 |
 | `price` | float \| None | None | 限价，None = 市价单 |
-| `stop_loss` | float \| None | None | 止损价（预留） |
-| `take_profit` | float \| None | None | 止盈价（预留） |
+| `stop_loss` | float \| None | None | 止损价。当根 bar 的 low 触及止损价时触发平仓信号 |
+| `take_profit` | float \| None | None | 止盈价。当根 bar 的 high 触及止盈价时触发平仓信号 |
+
+> **止损/止盈成交时点**：SL/TP 信号触发后，**延迟到下一根 bar 开盘成交**（与普通
+> 策略信号一致），而非在信号当根以触发价成交。若下一根跳空，取对持仓者更不利的实际
+> 开盘价（卖出取 `min(下一根开盘, 触发价)`）。这避免了"假设能在止损价精确成交"的
+> 前视偏差，回测结果更贴近真实滑点与跳空场景。
 
 **查看当前持仓**：
 

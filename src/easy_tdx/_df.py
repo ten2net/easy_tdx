@@ -20,6 +20,17 @@ _BAR_TIME_END = "end"
 _CATEGORY_MINUTES: dict[int, int] = {0: 5, 1: 15, 2: 30, 3: 60, 7: 1, 8: 3}
 
 
+_VALID_BAR_TIMES = (_BAR_TIME_START, _BAR_TIME_END)
+
+
+def _check_bar_time(bar_time: str) -> None:
+    """校验 bar_time 取值，非法值立即抛错（fail-fast），避免静默按 "end" 处理。"""
+    if bar_time not in _VALID_BAR_TIMES:
+        raise ValueError(
+            f"bar_time 必须是 {_BAR_TIME_START!r} 或 {_BAR_TIME_END!r}，得到: {bar_time!r}"
+        )
+
+
 def _category_to_minutes(category: int) -> int | None:
     """分钟级 KlineCategory → 每根 bar 的分钟数；日线及以上返回 None。"""
     return _CATEGORY_MINUTES.get(int(category))
@@ -126,6 +137,7 @@ def _apply_bar_time_align_df(
     """
     if bar_time == _BAR_TIME_START:
         return df
+    _check_bar_time(bar_time)
     if not is_intraday or delta_minutes is None or delta_minutes <= 0:
         return df
     if df.empty:
@@ -151,6 +163,7 @@ def _apply_bar_time_align_bars(
     """
     if bar_time == _BAR_TIME_START:
         return bars
+    _check_bar_time(bar_time)
     if not is_intraday or delta_minutes is None or delta_minutes <= 0:
         return bars
     result: list[Any] = []

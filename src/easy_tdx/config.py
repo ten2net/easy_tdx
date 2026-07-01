@@ -28,9 +28,13 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 _CONFIG_DIR = Path(os.environ.get("EASY_TDX_CONFIG_DIR", str(Path.home() / ".easy_tdx")))
 _CONFIG_FILE = _CONFIG_DIR / "config.json"
+
+# 业务时间统一用上海时区（与 client.py 一致），避免 naive datetime 跨时区歧义（审计 #18）。
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # ---------------------------------------------------------------------------
 # 源码内嵌默认值（config.json 不存在或字段缺失时的兜底）
@@ -242,7 +246,7 @@ def save_best_host(host: str) -> None:
     """保存最佳主机到配置文件；首次写入时同时补全默认配置。"""
     cfg = _load()
     cfg["best_host"] = host
-    cfg["best_host_updated_at"] = datetime.now().isoformat()
+    cfg["best_host_updated_at"] = datetime.now(_SHANGHAI_TZ).isoformat()
     if "known_hosts" not in cfg:
         cfg["known_hosts"] = list(_FALLBACK_HOSTS)
     if "calc_hosts" not in cfg:

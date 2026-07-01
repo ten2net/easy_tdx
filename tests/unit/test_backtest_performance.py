@@ -430,3 +430,80 @@ def test_calmar() -> None:
     # 卡玛比率 = annual_return / max_drawdown
     # 由于 max_drawdown 很小，calmar 会很大
     assert metrics["calmar"] > 0
+
+
+# ---------------------------------------------------------------------------
+# 除零边界回归（审计复审 N2 / 首轮 #11）
+#
+# performance.py 在计算日收益率时对 total[:-1]==0 的位置做了 safe_prev 守卫
+# （记为 NaN 后 np.isfinite 过滤），并对 total[0]==0 的总收益率做了 0.0 兜底。
+# 若有人不慎改回旧的 np.diff(total)/total[:-1]，这些测试应当红灯。
+# ---------------------------------------------------------------------------
+
+
+def _metrics_from_total(values: list[float]) -> dict[str, float]:
+    """从一组 total 值构造最小资金曲线并计算指标。"""
+    total = np.array(values, dtype=float)
+    peak = np.maximum.accumulate(total)
+    # 与生产回测一致：drawdown = peak - total；drawdown_pct = drawdown / peak
+    drawdown = peak - total
+    drawdown_pct = np.divide(drawdown, peak, out=np.zeros_like(drawdown), where=(peak != 0))
+    equity = pd.DataFrame(
+        {
+            "datetime": np.arange(len(total)),
+            "total": total,
+            "drawdown": drawdown,
+            "drawdown_pct": drawdown_pct,
+        }
+    )
+    return PerformanceAnalyzer(equity, _make_trades()).compute()
+
+
+def test_metrics_handles_zero_intermediate_equity() -> None:
+    """中间净值出现 0 时，日收益率除零不抛异常、返回有限值（审计复审 N2）。
+
+    total=[100, 0, 105, 0, 110]：第 1、3 根前值为 0，旧实现 diff/total[:-1]
+    会得到 inf，进而污染均值/方差计算或触发 RuntimeWarning。修复后这些位置
+    被 safe_prev 记为 NaN 并由 isfinite 过滤。
+    """
+    metrics = _metrics_from_total([100, 0, 105, 0, 110])
+
+    # 所有数值型指标必须有限（非 inf、非 NaN）
+    finite_keys = {
+        "total_return",
+        "annual_return",
+        "max_drawdown",
+        "sharpe",
+        "sortino",
+        "calmar",
+        "volatility",
+        "win_rate",
+        "profit_factor",
+    }
+    for key in finite_keys:
+        val = metrics[key]
+        assert np.isfinite(val), f"{key} 不是有限值: {val}"
+
+
+def test_metrics_handles_zero_first_equity() -> None:
+    """首根净值为 0 时 total_return 兜底为 0.0 而非除零（审计复审 N2）。
+
+    total[0]==0 时 (total[-1]/total[0]) - 1 会除零；修复后直接记 0.0。
+    """
+    metrics = _metrics_from_total([0, 100, 105, 110, 115])
+
+    # total_return 走 total[0]==0 分支，应为有限值
+    assert np.isfinite(metrics["total_return"]), f"total_return 非有限值: {metrics['total_return']}"
+    # 不抛异常即说明 max_drawdown 等也未受影响
+    assert np.isfinite(metrics["max_drawdown"])
+
+
+def test_metrics_all_zero_equity_does_not_raise() -> None:
+    """全 0 资金曲线不应产生 inf/nan，也不应抛异常（审计复审 N2 极端场景）。"""
+    # total 全 0 → safe_prev 全 NaN → daily_ret 过滤后为空 → 走 _empty_metrics
+    metrics = _metrics_from_total([0, 0, 0, 0, 0])
+
+    # 全 0 资金曲线收益率数据不足，应安全返回有限值（多数为 0）
+    assert np.isfinite(metrics["total_return"])
+    assert np.isfinite(metrics["max_drawdown"])
+    assert np.isfinite(metrics["sharpe"])

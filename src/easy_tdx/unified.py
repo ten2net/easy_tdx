@@ -250,6 +250,15 @@ class UnifiedTdxClient:
         start: int = 0,
         count: int = 600,
     ) -> pd.DataFrame:
+        """.. deprecated:: 1.16.2
+        与 :meth:`goods_list` 完全相同（历史遗留的重复代理方法）。
+        请改用 :meth:`goods_list`（与底层 ``MacExClient`` 命名一致）。
+        """
+        import warnings
+
+        warnings.warn(
+            "get_goods_list 是重复方法，请改用 goods_list", DeprecationWarning, stacklevel=2
+        )
         return self._ensure_mac_ex().goods_list(market, start, count)
 
     # ------------------------------------------------------------------ #
@@ -559,6 +568,15 @@ class AsyncUnifiedTdxClient:
         start: int = 0,
         count: int = 600,
     ) -> pd.DataFrame:
+        """.. deprecated:: 1.16.2
+        与 :meth:`goods_list` 完全相同（历史遗留的重复代理方法）。
+        请改用 :meth:`goods_list`（与底层 ``MacExClient`` 命名一致）。
+        """
+        import warnings
+
+        warnings.warn(
+            "get_goods_list 是重复方法，请改用 goods_list", DeprecationWarning, stacklevel=2
+        )
         ex = await self._ensure_mac_ex()
         return await ex.goods_list(market, start, count)
 

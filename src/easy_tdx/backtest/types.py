@@ -25,6 +25,9 @@ class Signal:
         price: 限价（None = 市价单）
         stop_loss: 止损价（None = 不设置）
         take_profit: 止盈价（None = 不设置）
+        source: 信号来源。"strategy"=策略产生（默认）；
+            "stop"=止损/止盈触发。stop 来源的信号不在信号 bar 当根成交，
+            而是延迟到下一根开盘（消除用当根 intrabar 触发价成交的前视偏差）。
     """
 
     datetime: int
@@ -33,6 +36,7 @@ class Signal:
     price: float | None = None
     stop_loss: float | None = None
     take_profit: float | None = None
+    source: str = "strategy"
 
 
 # ── 成交记录 ────────────────────────────────────────────────────────────────

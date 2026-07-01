@@ -80,16 +80,18 @@ class PerformanceAnalyzer:
         total = self._equity_curve["total"].to_numpy()
         drawdown = self._equity_curve["drawdown"].to_numpy()
 
-        # 计算日收益率
-        daily_ret = np.diff(total) / total[:-1]
-        daily_ret = daily_ret[~np.isnan(daily_ret)]
+        # 计算日收益率（除零保护：前值为 0 的位置记为 NaN 后一并过滤）
+        safe_prev = np.where(total[:-1] != 0, total[:-1], np.nan)
+        daily_ret = np.diff(total) / safe_prev
+        # 同时过滤 NaN 和 inf（前值为 0 会产生 inf/nan）
+        daily_ret = daily_ret[np.isfinite(daily_ret)]
 
         # 日收益率数量太少时返回空指标
         if len(daily_ret) < 2:
             return self._empty_metrics()
 
-        # 1. 总收益率
-        total_return = (total[-1] / total[0]) - 1
+        # 1. 总收益率（首根净值为 0 时无法定义，记为 0.0）
+        total_return = (total[-1] / total[0]) - 1 if total[0] != 0 else 0.0
 
         # 2. 年化收益率
         n = len(daily_ret)

@@ -404,22 +404,28 @@ class VWAPExecution(ExecutionModel):
         )
 
     def _get_volume_weights(self, df: pd.DataFrame, bar_idx: int) -> list[float]:
-        """获取成交量权重分布。"""
+        """获取未来 n_bars 根的成交量权重分布（用于 VWAP 拆单）。
+
+        **仅使用 ``bar_idx`` 及之前的成交量（lookback 窗口）估计未来分布，
+        严格不读未来数据，避免前视偏差**（与 TWAP 等模型只用历史数据的约定一致）。
+        当 lookback 数据少于 n_bars 时，用 ``np.resize`` 显式平铺到 n_bars 长度，
+        消除旧的 ``i % len(volumes)`` 取模在 n_bars > lookback 时产生的周期性
+        循环索引（与真实 VWAP 行为不符）。
+        """
         start = max(0, bar_idx - self._volume_lookback + 1)
         lookback = df.iloc[start : bar_idx + 1]
         vol_series = _volume_series(lookback)
         if vol_series is None or len(lookback) == 0:
             return [1.0 / self._n_bars] * self._n_bars
-
         volumes = vol_series.to_numpy()
-        total_vol = float(volumes.sum())
+        if float(volumes.sum()) <= 0:
+            return [1.0 / self._n_bars] * self._n_bars
+        # 平铺到 n_bars 长度（不足时重复整个历史序列，作为因果合法的外推近似）
+        vols = np.resize(volumes, self._n_bars)
+        total_vol = float(vols.sum())
         if total_vol <= 0:
             return [1.0 / self._n_bars] * self._n_bars
-
-        weights: list[float] = []
-        for i in range(self._n_bars):
-            idx = max(0, len(volumes) - 1 - (i % max(1, len(volumes))))
-            weights.append(float(volumes[idx]) / total_vol)
+        weights = [float(v) / total_vol for v in vols]
         total_w = sum(weights)
         if total_w <= 0:
             return [1.0 / self._n_bars] * self._n_bars

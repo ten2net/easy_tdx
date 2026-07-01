@@ -13,7 +13,6 @@ venv/
 .omc/
 .claude/
 .playwright-mcp/
-uv.lock
 docs/_build/
 FK/
 
@@ -26,3 +25,6 @@ src/easy_tdx/exchange_margin.py
 
 # 本地文件，不递交到 GitHub
 CLAUDE.md
+
+# 代码审计报告（本地产物，不入库）
+audit-report-*.html

@@ -7,6 +7,10 @@
 readme
 api_reference
 field_mapping
+backtest_usage
+quantitative-guide
+protocol-reverse-engineering
+protocol-unknown-fields
 indicator-zhuoyao
 indicator-bias-signal
 ```

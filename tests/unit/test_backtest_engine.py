@@ -435,13 +435,19 @@ def test_stop_loss_triggers_sell():
 
 
 def test_take_profit_triggers_sell():
-    """Test take-profit triggers auto SELL when price rises above target."""
+    """Test take-profit triggers auto SELL when price rises above target.
+
+    注意（审计 #4）：止盈信号延迟到下一根开盘成交（消除前视偏差）。
+    当下一根开盘价低于触发价时（跳空回落），SELL 取更不利的实际开盘价。
+    """
     df = _make_flat_df(n=30)
     # Bar 12 rises above take_profit=110.0
     df.loc[12, "high"] = 112.0
     df.loc[12, "low"] = 108.0
     df.loc[12, "close"] = 111.0
     df.loc[12, "open"] = 109.0
+    # Bar 13 开盘回落到 100（跳空），止盈延迟成交应取更不利的 100 而非触发价 110
+    df.loc[13, "open"] = 100.0
 
     engine = BacktestEngine(TakeProfitStrategy, cash=100000)
     result = engine.run(df)
@@ -451,8 +457,36 @@ def test_take_profit_triggers_sell():
 
     # Should have at least one SELL triggered by take-profit
     assert len(sell_trades) >= 1, "Expected take-profit sell"
-    # Sell price should be at take_profit price (110.0)
-    assert sell_trades.iloc[0]["price"] == 110.0
+    # 延迟到下一根（bar 13）开盘成交，跳空回落取更不利的实际价 100（非触发价 110）
+    assert sell_trades.iloc[0]["price"] == 100.0
+
+
+def test_stop_loss_gap_down_fills_at_worse_price():
+    """SL 信号延迟到下一根开盘成交；若跳空下跌，取更不利的开盘价（审计 #4）。
+
+    构造当根触及止损、但下一根开盘远低于止损价的跳空场景，
+    断言实际成交价取更不利的开盘价，回测净值低于"触发价成交"基线。
+    """
+    df = _make_flat_df(n=30)
+    # Bar 12 触及 stop_loss=95（low=93）
+    df.loc[12, "low"] = 93.0
+    df.loc[12, "high"] = 96.0
+    df.loc[12, "close"] = 94.0
+    df.loc[12, "open"] = 97.0
+    # Bar 13 跳空低开到 90（远低于止损价 95），应取 90 而非 95
+    df.loc[13, "open"] = 90.0
+    df.loc[13, "low"] = 89.0
+    df.loc[13, "high"] = 91.0
+    df.loc[13, "close"] = 90.5
+
+    engine = BacktestEngine(StopLossStrategy, cash=100000)
+    result = engine.run(df)
+
+    trades = result.trades[~result.trades["rejected"]]
+    sell_trades = trades[trades["direction"] == "SELL"]
+    assert len(sell_trades) >= 1, "Expected stop-loss sell"
+    # 跳空下跌：SELL 取 min(next_open=90, trigger=95) = 90（更不利）
+    assert sell_trades.iloc[0]["price"] == 90.0
 
 
 def test_stop_loss_not_triggered_when_price_stays_above():

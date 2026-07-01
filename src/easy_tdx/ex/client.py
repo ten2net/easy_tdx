@@ -2,11 +2,14 @@
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
+from collections.abc import Awaitable
 from types import TracebackType
 from typing import TypeVar
 
 from .._df import _apply_bar_time_align_bars, _category_to_minutes
+from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
 from ..commands.base import BaseCommand
 from ..config import get_best_ex_host, get_ex_hosts, save_best_ex_host
 from ..exceptions import TdxConnectionError
@@ -118,15 +121,23 @@ class ExTdxClient:
         self.close()
 
     def _execute(self, cmd: "BaseCommand[_T]") -> _T:
+        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。"""
         try:
             return self._conn.execute(cmd)
         except TdxConnectionError:
             if not self._auto_reconnect:
                 raise
-            self._conn.close()
-            self._conn = ExTdxConnection(self._host, self._port, self._timeout)
-            self._conn.connect()
-            return self._conn.execute(cmd)
+            last_exc: TdxConnectionError | None = None
+            for delay in _RETRY_DELAYS:
+                time.sleep(delay)
+                self._conn.close()
+                self._conn = ExTdxConnection(self._host, self._port, self._timeout)
+                self._conn.connect()
+                try:
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------ #
     # 市场信息
@@ -260,7 +271,7 @@ class ExTdxClient:
 # ============================================================
 
 
-class AsyncExTdxClient:
+class AsyncExTdxClient(AsyncHeartbeatMixin):
     """异步扩展行情客户端（asyncio，端口 7727）。
 
     使用示例::
@@ -335,43 +346,29 @@ class AsyncExTdxClient:
     ) -> None:
         await self.close()
 
-    def _start_heartbeat(self) -> None:
-        if self._heartbeat_interval <= 0:
-            return
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-    async def _stop_heartbeat(self) -> None:
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-
-    async def _heartbeat_loop(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(self._heartbeat_interval)
-                await self.get_instrument_count()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
+    def _heartbeat_cmd(self) -> Awaitable[object]:
+        """心跳使用的轻量请求（get_instrument_count，复用 _execute 重连）。"""
+        return self.get_instrument_count()
 
     async def _execute(self, cmd: "BaseCommand[_T]") -> _T:
+        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。"""
         async with self._execute_lock:
             try:
                 return await self._conn.execute(cmd)
             except TdxConnectionError:
                 if not self._auto_reconnect:
                     raise
-                await self._conn.close()
-                self._conn = AsyncExTdxConnection(self._host, self._port, self._timeout)
-                await self._conn.connect()
-                return await self._conn.execute(cmd)
+                last_exc: TdxConnectionError | None = None
+                for delay in _RETRY_DELAYS:
+                    await asyncio.sleep(delay)
+                    await self._conn.close()
+                    self._conn = AsyncExTdxConnection(self._host, self._port, self._timeout)
+                    await self._conn.connect()
+                    try:
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------ #
     # 市场信息

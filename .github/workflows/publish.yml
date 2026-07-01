@@ -26,4 +26,6 @@ jobs:
 
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          attestations: false
+          # 启用 PyPI 签名认证（sigstore provenance），让用户可验证产物来源。
+          # id-token: write 已在上方 permissions 配置，OIDC trusted publishing 直连。
+          attestations: true

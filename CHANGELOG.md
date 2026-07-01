@@ -2,6 +2,45 @@
 
 本文件记录 easy-tdx 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [1.16.2] — 2026-07-02
+
+**质量加固版本** —— 经三轮代码审计（B 6.9 → A 7.6 → A 7.9）后的综合修复，覆盖协议核心层、数据正确性、错误处理、测试真实度与可维护性。**761 单测全绿**（+58），`ruff check` / `ruff format --check` / `mypy strict` 全部通过，CI 加 Windows 矩阵 + trusted publishing + 签名，达到稳定 PyPI 库发布质量。
+
+### 修复
+
+- **离线 `.day` 文件追加写入非原子，崩溃即损坏**（`offline/write_daily.py`，审计 #1）— 追加行情数据时若进程被杀 / 断电，会留下半截 bar 破坏整文件可读性。新增 `fsync + flush` 强制落盘，写入路径完成后调用独立的 `_repair_tail` 修复尾部残条，并在读取侧（`get_last_bar_date`）做完整性校验。**严格遵守 command-query separation**：「get」函数纯读不写，损坏清理只在写入路径触发——超出审计建议。
+- **回测止损存在前视偏差**（`backtest/execution.py`、`backtest/orders.py`，审计 #4）— 止损单当根触发当根成交，等于用未知的当根收盘价决策。改为延迟到**下一根开盘**成交，并加**跳空保护**（SELL 取 `min(开盘, 触发价)`，即对持仓者更不利的价格，模拟真实滑点）。新增专门的 gap 回归测试。
+- **VWAP 因子权重索引错误**（`factor/builtin/`，审计 #3）— `np.resize` 平铺权重时索引错位，导致计算用了未来数据（前视偏差）。显式用 `np.resize` 平铺，docstring 明确「仅用历史数据避免前视」。
+- **`bar_time` 非法值静默回退**（`_df.py`、`client.py`、`ex/client.py`、`mac/client.py`，审计 #5）— 传入非法 `bar_time` 时静默当作默认值处理，掩盖用户错误。改为 fail-fast 抛 `ValueError`（同步 + 异步路径都加）。
+- **绩效分析除零**（`backtest/performance.py`，审计 #11）— 日收益率 `np.diff(total) / total[:-1]` 在首根或中间净值为 0 时产生 `inf`，污染 sharpe / volatility 等指标。改为 `safe_prev = np.where(total[:-1] != 0, ..., np.nan)` + `np.isfinite` 过滤；总收益率在 `total[0] == 0` 时兜底为 `0.0`。新增 3 个边界回归测试（中间含 0 / 首根 = 0 / 全零）。
+- **闭包延迟绑定循环变量 `date`**（`client.py`，审计 #10）— `get_history_fund_flow` 在循环里用 `lambda` 捕获 `date`，所有闭包共享最后一次的值。改用默认参数 `_d=date` 立即绑定。
+- **路径穿越**（`offline/paths.py`，审计 #16）— 用户传入含 `/`、`\` 或 `..` 的代码可逃出 `vipdoc` 目录。新增清洗拒绝危险字符（保留通达信文件名常见的 `#`）。
+- **`ruff check` 报 2 个 UP038 错误致 CI 红灯**（`cninfo/client.py`、`factor/engine.py`，审计复审 N1）— `isinstance(x, (int, float))` 在 pyupgrade 规则下应改 `int | float`（PEP 604，Python ≥3.10 运行时合法）。修复后 `ruff check src/ tests/` 全过。
+- **naive datetime 跨时区误判缓存过期**（`client.py`、`config.py`，审计 #18）— 缓存时间戳用 naive datetime，UTC 机器（如 CI）与本地 +8 机器比较时差 8 小时，导致缓存频繁失效或永不过期。统一用 aware datetime（`Asia/Shanghai`），并兼容旧 naive 缓存（检测到 naive 时 localize）。
+
+### 变更
+
+- **抽出 `AsyncHeartbeatMixin`，收敛 4 处心跳副本**（`_reconnect.py`、`client.py`、`ex/client.py`、`ex/mac_client.py`、`mac/client.py`，审计复审 L1）— 4 个 async client（A股 / MAC / 扩展行情 / 扩展 MAC）的 `_start_heartbeat` / `_stop_heartbeat` / `_heartbeat_loop` 三件套**逐字节重复**（仅心跳命令和 logger 名不同），共 12 处副本。抽出到 `AsyncHeartbeatMixin`，子类只需实现 `_heartbeat_cmd()` 返回心跳 awaitable。同时统一 `_HEARTBEAT_RETRYABLE = (OSError, TdxConnectionError, TdxDecodeError)` 异常范围（审计 #6 收窄，不吞代码 bug）。未来改心跳策略只需改一处。
+- **统一重连退避序列 `_RETRY_DELAYS`**（`_reconnect.py`，审计 #2）— 原先 6 处 client 副本里 MAC 用 4 次退避、扩展行情用 1 次，韧性策略不一致（最高危的行为分歧）。统一为 `(0.1, 0.5, 1.0, 2.0)` 4 次指数退避。
+- **`unified.py` 重复方法加 `DeprecationWarning`**（审计 #14）— `UnifiedTdxClient` 与子 client 的同名方法重复，加弃用警告而非硬删，向后兼容。
+- **`MAJORITY` 投票因子退化时告警**（审计 #17）— 样本数 `n < 3` 时投票无意义，原静默退化，现加 `logger.warning`。
+- **scanner 并行扫描接入增量缓存**（`screen/scanner.py`，审计 #15）— 并行路径原先绕过 mtime 缓存，每次 `--workers` 全量重算 5000 只。现与串行路径一致地按 mtime 跳过未变文件。
+- **async gather 假并发诚实文档化**（`mac/client.py`，审计 #12）— 单 TCP 连接的 `asyncio.gather` 实际串行（受 `_execute_lock` 约束），docstring 明确说明「无并发加速收益，如需真正并发需连接池」。
+
+### 新增
+
+- **scanner 系统性失败可观测性**（`screen/scanner.py`，审计 #6 / 复审 L2）— 串行 + 并行扫描循环原先 `except Exception: continue` 完全静默，系统性失败（大量损坏 `.day` / 磁盘故障）被吞，用户得到空结果却以为「没有信号」。现在：① 每个单股失败记 `logger.warning`（带 `exc_info`）；② 失败率 ≥ 50% 时循环结束发醒目汇总告警；③ 策略计算异常记 debug（避免 5000 只批量刷屏）。新增 2 个 caplog 回归测试。
+- **公共 API 类型契约测试**（`tests/unit/test_public_api.py`，审计 #13 / 复审 L3）— 原先只验证 `__all__` 中每个名字「可导入」，无法捕获「类被误绑成模块 / None」。新增 `inspect.isclass` / `callable` 类型断言 + **契约完整性双向守卫**（同时检查「导出了但没声明类型」和「声明了但没导出」），防止 `__all__` 与类型契约表漂移。
+- **5 个关键路径测试文件**（审计 #9）— 新增 `test_client_reconnect.py`（验证精确退避序列 + 4 次重试耗尽）、`test_ex_reconnect.py`（扩展行情统一退避 + MAC 重登录每次重试）、`test_config.py`（三级 host 优先级 + 原子写 + 缓存合并）、`test_codec_bitmap.py`（字节级编解码往返）、`test_public_api.py`（见上）。覆盖率门槛 50 → 60（实测 61%）。
+
+### 发布工程
+
+- **CI 加 Windows 矩阵**（`.github/workflows/ci.yml`，审计 #7）— 原 CI 仅 Linux，而通达信用户主要在 Windows。加 `windows-latest` 矩阵 + `fail-fast: false`。
+- **启用 PyPI trusted publishing + sigstore 签名**（`.github/workflows/publish.yml`，审计 #8）— 发布产物加 attestations 签名认证，提升供应链可信度。
+- **锁定 dev 工具链 + 依赖加上界**（`requirements-dev.txt`、`pyproject.toml`，审计 #8）— 新增 `requirements-dev.txt` 锁定 pytest / mypy / ruff / scipy 版本（CI 可复现）；运行时依赖加下界 + 上界（`pandas>=2.0,<3`、`click>=8.0,<9`、`fastapi<1`）。
+- **删除 README 造假的 bandit 徽章**（审计 #8）— 徽章声称跑了 bandit 安全扫描但实际没有，移除。
+- **`ruff format` 全仓合规**（审计复审 V3-1）— 修复 2 个文件的格式不合规，`ruff format --check src/ tests/` 全过。
+
 ## [1.16.1] — 2026-07-01
 
 ### 修复

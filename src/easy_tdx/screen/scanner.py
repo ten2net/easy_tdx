@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,13 @@ from easy_tdx.backtest.combo import extract_factor_signals
 from easy_tdx.backtest.strategy import Strategy
 from easy_tdx.offline.daily_bar import _detect_security_type, read_daily_bars
 from easy_tdx.offline.paths import resolve_vipdoc
+
+logger = logging.getLogger(__name__)
+
+# 单股扫描失败（损坏的 .day、策略抛错等）属于"跳过该股、继续扫"的容错语义，
+# 但完全静默会让系统性失败（如断网后所有文件读取异常）被吞掉（审计 #6 / 复审 L2）。
+# 因此：每次失败记录 warning，扫描结束后若失败率超过阈值则记录 summary。
+_SCAN_FAILURE_RATE_THRESHOLD = 0.5
 
 # A 股类型白名单
 _A_STOCK_TYPES = frozenset(
@@ -135,6 +143,9 @@ class SignalScanner:
         cache = self._load_cache()
         results: list[ScanResult] = []
         updated_cache: dict[str, Any] = {}
+        # 单股扫描失败计数（审计 #6 / 复审 L2）：系统性失败（如大量损坏 .day）
+        # 不应被完全静默，循环结束后按失败率发出汇总告警。
+        failures = 0
 
         for idx, (filepath, market, code) in enumerate(files):
             if progress_callback:
@@ -182,7 +193,13 @@ class SignalScanner:
                     ),
                 }
             except Exception:
+                # 单股失败属"跳过继续"容错语义，但记录 warning 以暴露系统性
+                # 失败（如损坏 .day / 策略 bug），不再完全静默（审计 #6 / 复审 L2）。
+                failures += 1
+                logger.warning("扫描 %s (%s) 失败，已跳过", code, filepath.name, exc_info=True)
                 continue
+
+        self._scan_failure_summary(failures, total)
 
         self._save_cache(updated_cache)
 
@@ -198,45 +215,136 @@ class SignalScanner:
         workers: int,
         progress_callback: Any,
     ) -> list[ScanResult]:
-        """并发扫描（ProcessPoolExecutor）。"""
+        """并发扫描（ProcessPoolExecutor）。
+
+        与串行路径一致地接入 mtime 增量缓存（审计 #15）：派发任务前先按 mtime
+        跳过未变文件、复用缓存结果，仅对变化的文件派发到进程池；子进程结果
+        返回后由主进程统一写缓存，避免每次 --workers 全量重算 5000 只。
+        """
         import concurrent.futures
 
         # 策略类不可跨进程 pickle（动态 importlib 加载的类子进程无法解析），
         # 改为传递策略文件路径，子进程自行加载
         strategy_file = _get_strategy_file(self._strategy_cls)
 
-        # 构建参数：每个任务需要的独立数据（全部为可 pickle 的基础类型）
-        tasks = [
-            (str(filepath), market, code, strategy_file, self._cash, self._commission)
-            for filepath, market, code in files
-        ]
-
+        cache = self._load_cache()
+        updated_cache: dict[str, Any] = {}
         results: list[ScanResult] = []
         completed = 0
+        # 单股扫描失败计数（审计 #6 / 复审 L2）：与串行路径一致。
+        failures = 0
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_idx = {
-                executor.submit(_scan_one_file, *task): i for i, task in enumerate(tasks)
-            }
-
-            for future in concurrent.futures.as_completed(future_to_idx):
+        # 第一遍：命中缓存的文件直接复用，未命中的收集为待扫描任务
+        pending: list[tuple[int, tuple[Path, str, str], float]] = []
+        for idx, (filepath, market, code) in enumerate(files):
+            cache_key = str(filepath)
+            try:
+                mtime = filepath.stat().st_mtime
+            except OSError:
                 completed += 1
-                idx = future_to_idx[future]
-
                 if progress_callback:
-                    progress_callback(completed, total, files[idx][0].name)
+                    progress_callback(completed, total, filepath.name)
+                continue
 
-                try:
-                    result = future.result()
-                    if result is not None:
-                        results.append(result)
-                except Exception:
-                    continue
+            cached = cache.get(cache_key)
+            if cached is not None and cached.get("mtime") == mtime:
+                result_data = cached.get("result")
+                if result_data is not None:
+                    results.append(
+                        ScanResult(
+                            code=result_data["code"],
+                            market=result_data["market"],
+                            signal_date=result_data["signal_date"],
+                            last_close=result_data["last_close"],
+                        )
+                    )
+                updated_cache[cache_key] = cached
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total, filepath.name)
+            else:
+                pending.append((idx, (filepath, market, code), mtime))
+
+        # 第二遍：仅对变化的文件派发到进程池
+        tasks = [
+            (str(filepath), market, code, strategy_file, self._cash, self._commission)
+            for _, (filepath, market, code), _ in pending
+        ]
+
+        if tasks:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                future_to_pending = {
+                    executor.submit(_scan_one_file, *task): pend
+                    for task, pend in zip(tasks, pending)
+                }
+
+                for future in concurrent.futures.as_completed(future_to_pending):
+                    idx, (filepath, market, code), mtime = future_to_pending[future]
+                    completed += 1
+
+                    if progress_callback:
+                        progress_callback(completed, total, filepath.name)
+
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            results.append(result)
+                        # 子进程结果回写缓存（主进程统一写，保证一致性）
+                        updated_cache[str(filepath)] = {
+                            "mtime": mtime,
+                            "result": (
+                                {
+                                    "code": result.code,
+                                    "market": result.market,
+                                    "signal_date": result.signal_date,
+                                    "last_close": result.last_close,
+                                }
+                                if result is not None
+                                else None
+                            ),
+                        }
+                    except Exception:
+                        # 子进程异常（损坏 .day / 策略 bug）不再完全静默，
+                        # 记录 warning 并计数，循环结束后按失败率汇总告警
+                        # （审计 #6 / 复审 L2）。
+                        failures += 1
+                        logger.warning(
+                            "扫描 %s (%s) 失败，已跳过",
+                            code,
+                            filepath.name,
+                            exc_info=True,
+                        )
+                        continue
+
+        self._scan_failure_summary(failures, total)
+
+        self._save_cache(updated_cache)
 
         if progress_callback:
             progress_callback(total, total, "done")
 
         return results
+
+    @staticmethod
+    def _scan_failure_summary(failures: int, total: int) -> None:
+        """扫描结束后按失败率发出汇总告警（审计 #6 / 复审 L2）。
+
+        单股失败本身是"跳过继续"的容错语义，不中断整批扫描；但当失败比例
+        超过阈值（如一半文件损坏/读取异常）时，几乎可以肯定是系统性问题
+        （目录配置错误、磁盘故障、策略 bug），此时发出一条醒目的 warning，
+        避免用户得到一份"空结果"却以为"没有信号"。
+        """
+        if failures <= 0 or total <= 0:
+            return
+        rate = failures / total
+        if rate >= _SCAN_FAILURE_RATE_THRESHOLD:
+            logger.warning(
+                "扫描完成但失败率过高：%d/%d (%.0f%%) 的文件扫描失败，"
+                "请检查 .day 文件完整性或策略实现",
+                failures,
+                total,
+                rate * 100,
+            )
 
     def _collect_files(self, universe: str) -> list[tuple[Path, str, str]]:
         """收集需要扫描的 .day 文件列表。
@@ -367,6 +475,9 @@ class SignalScanner:
                 commission=self._commission,
             )
         except Exception:
+            # 单股策略计算失败视为"无信号"并跳过；debug 记录以便排查策略 bug，
+            # 不升级为 warning 以免在 5000 只批量扫描时刷屏（审计 #6 / 复审 L2）。
+            logger.debug("策略计算异常 %s，视为无信号", code, exc_info=True)
             return None
 
         # 检查最后一根 bar 是否有买入信号
@@ -495,6 +606,9 @@ def _scan_one_file(
             commission=commission,
         )
     except Exception:
+        # 单股策略计算失败视为"无信号"并跳过；debug 记录以便排查策略 bug
+        # （审计 #6 / 复审 L2）。
+        logger.debug("策略计算异常 %s，视为无信号", code, exc_info=True)
         return None
 
     if not factor_signals.buy_mask[-1]:

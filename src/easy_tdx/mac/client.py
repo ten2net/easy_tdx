@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable
 from dataclasses import asdict
 from types import TracebackType
 from typing import Any, TypeVar
@@ -12,6 +13,7 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .._df import _apply_bar_time_align_df, _period_to_minutes, _to_df
+from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
 from ..codec.bitmap import Fields, PresetField
 from ..commands.base import BaseCommand
 from ..config import get_best_host, get_mac_hosts, get_port, get_timeout, save_best_host
@@ -45,7 +47,6 @@ from .models import (
     MacTickChart,
 )
 
-_RETRY_DELAYS = (0.1, 0.5, 1.0, 2.0)
 _KLINE_PAGE_SIZE = 700
 _BOARD_MEMBERS_PAGE_SIZE = 80
 
@@ -1042,7 +1043,7 @@ class MacClient:
 # ============================================================
 
 
-class AsyncMacClient:
+class AsyncMacClient(AsyncHeartbeatMixin):
     """异步 MAC 协议客户端（asyncio）。
 
     使用示例::
@@ -1150,34 +1151,12 @@ class AsyncMacClient:
         await self.close()
 
     # ------------------------------------------------------------------ #
-    # 心跳
+    # 心跳（三件套由 AsyncHeartbeatMixin 提供，审计复审 L1）
     # ------------------------------------------------------------------ #
 
-    def _start_heartbeat(self) -> None:
-        if self._heartbeat_interval <= 0:
-            return
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-    async def _stop_heartbeat(self) -> None:
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-
-    async def _heartbeat_loop(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(self._heartbeat_interval)
-                await self._execute(KlineOffsetCmd(0, 1))
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
+    def _heartbeat_cmd(self) -> Awaitable[object]:
+        """心跳使用的轻量请求（KlineOffset，复用 _execute 重连）。"""
+        return self._execute(KlineOffsetCmd(0, 1))
 
     # ------------------------------------------------------------------ #
     # 内部执行
@@ -1568,8 +1547,14 @@ class AsyncMacClient:
     ) -> pd.DataFrame:
         """获取板块涨跌幅排行榜（含成交额、成交量、资金流入流出、涨跌家数）。
 
-        先通过 ``get_board_list`` 获取全部板块，再并发调用
+        先通过 ``get_board_list`` 获取全部板块，再逐个调用
         ``get_board_summary`` 聚合成分股数据，合并为排行榜 DataFrame。
+
+        .. note::
+            实现中使用了 ``asyncio.gather``，但单 TCP 连接不支持并发请求——
+            每个 ``_fetch_row`` 内部调用 ``_execute`` 时都会持有 ``_execute_lock``，
+            因此 gather 实际是**串行**执行的，仅作代码组织用途，无并发加速收益。
+            如需真正并发拉取多个板块，需引入连接池（多 ``AsyncTdxConnection``）。
 
         Args:
             board_type: 板块类型（``BoardType.HY`` 行业 / ``BoardType.GN`` 概念）。

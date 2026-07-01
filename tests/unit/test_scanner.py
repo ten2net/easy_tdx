@@ -210,3 +210,57 @@ class TestIncrementalScan:
         codes2 = sorted(r.code for r in results2)
         # 结果可能相同 (策略没变), 但不应崩溃
         assert len(codes2) >= 1
+
+
+class TestScanFailureLogging:
+    """扫描失败日志回归（审计复审 L2）。
+
+    首轮 #6 将扫描循环的 ``except Exception: continue`` 评为"系统性失败被静默
+    吞掉"。复审 L2 修复：单股失败记录 warning + 失败计数，失败率超阈值时
+    循环结束发出 summary。这些测试用 monkeypatch 让 ``_scan_one`` 抛错模拟
+    损坏 .day / 策略异常等场景，断言失败被记录（read_daily_bars 本身对短文件
+    容错返回 0 条，不会抛错，故用 monkeypatch 构造确定性失败）。
+    """
+
+    def test_serial_scan_logs_per_stock_failure(
+        self, vipdoc: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """单股 _scan_one 抛错时，串行扫描应记录 warning（审计复审 L2）。"""
+        scanner = SignalScanner(AlwaysBuyStrategy, vipdoc_path=vipdoc)
+
+        def _boom(self: SignalScanner, filepath: Path, market: str, code: str) -> None:
+            raise RuntimeError(f"simulated corrupt day for {code}")
+
+        monkeypatch.setattr(SignalScanner, "_scan_one", _boom)
+
+        with caplog.at_level("WARNING", logger="easy_tdx.screen.scanner"):
+            results = scanner.scan(universe="all", workers=0)
+
+        # 全部抛错 → 无结果，但不崩溃（容错语义：跳过继续）
+        assert results == []
+        # 每个被扫描的 A 股都应有一条 warning
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) >= 1, "单股失败应触发 warning 日志"
+        assert any("失败" in r.getMessage() for r in warnings)
+
+    def test_serial_scan_high_failure_rate_emits_summary(
+        self, vipdoc: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """失败率超阈值时应发出汇总告警（审计复审 L2）。
+
+        全部 A 股 _scan_one 抛错（失败率 100% > 50% 阈值），断言扫描完成后
+        有一条 summary warning。
+        """
+        scanner = SignalScanner(AlwaysBuyStrategy, vipdoc_path=vipdoc)
+
+        def _boom(self: SignalScanner, filepath: Path, market: str, code: str) -> None:
+            raise RuntimeError(f"simulated corrupt day for {code}")
+
+        monkeypatch.setattr(SignalScanner, "_scan_one", _boom)
+
+        with caplog.at_level("WARNING", logger="easy_tdx.screen.scanner"):
+            scanner.scan(universe="all", workers=0)
+
+        # 应有汇总告警提到"失败率过高"
+        summary_msgs = [r.getMessage() for r in caplog.records if "失败率" in r.getMessage()]
+        assert summary_msgs, "失败率过高时应发出汇总 warning"

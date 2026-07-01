@@ -24,7 +24,7 @@ def _datetime_to_int(dt_val: object) -> int:
     if hasattr(dt_val, "strftime"):
         strftime = getattr(dt_val, "strftime")
         return int(strftime("%Y%m%d"))
-    if isinstance(dt_val, (int, float)):
+    if isinstance(dt_val, int | float):
         return int(dt_val)
     return 0
 

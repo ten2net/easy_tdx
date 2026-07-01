@@ -374,6 +374,7 @@ class BacktestEngine:
                         direction="SELL",
                         size=0,  # full position close
                         price=trigger_price,
+                        source="stop",  # 标记为止损/止盈触发，延迟到下一根成交
                     )
                 )
             else:

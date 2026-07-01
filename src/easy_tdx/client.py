@@ -22,6 +22,7 @@ from ._df import (
     _merge_txn_datetime,
     _to_df,
 )
+from ._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
 from .codec.block import parse_block_dat
 from .codec.financial import parse_financial_dat, parse_financial_file_list
 from .codec.industry import parse_tdxhy_cfg
@@ -60,7 +61,6 @@ from .models.timeseries import TransactionRecord
 from .transport.async_ import AsyncTdxConnection
 from .transport.sync import TdxConnection, ping_all
 
-_RETRY_DELAYS = (0.1, 0.5, 1.0, 2.0)
 _T = TypeVar("_T")
 _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 _DAILY_PLUS = frozenset(
@@ -176,7 +176,11 @@ def _load_cache() -> list[SecurityInfo] | None:
     try:
         raw = json.loads(path.read_text("utf-8"))
         updated = datetime.fromisoformat(raw["updated"])
-        if (datetime.now() - updated).total_seconds() > _CACHE_MAX_AGE:
+        # 统一用 aware datetime 比较（审计 #18）：旧缓存可能写的是 naive datetime，
+        # 此处 localize 到上海时区，避免跨时区机器（如 CI 的 UTC 与本地 +8）误判过期。
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=_SHANGHAI_TZ)
+        if (datetime.now(_SHANGHAI_TZ) - updated).total_seconds() > _CACHE_MAX_AGE:
             return None
         return _deserialize_stocks(raw["data"])
     except Exception:
@@ -186,7 +190,7 @@ def _load_cache() -> list[SecurityInfo] | None:
 def _save_cache(stocks: list[SecurityInfo]) -> None:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     data = {
-        "updated": datetime.now().isoformat(),
+        "updated": datetime.now(_SHANGHAI_TZ).isoformat(),
         "count": len(stocks),
         "data": _serialize_stocks(stocks),
     }
@@ -781,12 +785,16 @@ class TdxClient:
         results: list[HistoricalFundFlow] = []
         for bar in bars:
             date = _date_from_bar(bar)
-            records = self._collect_transaction_records(
-                lambda page_start, page_size: self._execute(
-                    GetHistoryTransactionDataCmd(market, code, date, page_start, page_size)
-                ),
-                800,
-            )
+
+            # 用闭包工厂立即绑定 date（审计 #10），避免 lambda 延迟绑定循环变量。
+            def _fetch_page(
+                page_start: int, page_size: int, _d: int = date
+            ) -> list[TransactionRecord]:
+                return self._execute(
+                    GetHistoryTransactionDataCmd(market, code, _d, page_start, page_size)
+                )
+
+            records = self._collect_transaction_records(_fetch_page, 800)
             results.append(_historical_fund_flow_from_records(date, records))
         return _to_df(results)
 
@@ -796,7 +804,7 @@ class TdxClient:
 # ============================================================
 
 
-class AsyncTdxClient:
+class AsyncTdxClient(AsyncHeartbeatMixin):
     """异步通达信行情客户端（asyncio）。
 
     使用示例::
@@ -883,37 +891,9 @@ class AsyncTdxClient:
     ) -> None:
         await self.close()
 
-    def _start_heartbeat(self) -> None:
-        """启动后台心跳任务。"""
-        if self._heartbeat_interval <= 0:
-            return
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-    async def _stop_heartbeat(self) -> None:
-        """停止并清理心跳任务。"""
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-
-    async def _heartbeat_loop(self) -> None:
-        """心跳循环：定期发送轻量级请求保活。"""
-        while True:
-            try:
-                await asyncio.sleep(self._heartbeat_interval)
-                # 使用 get_security_count 作为心跳包
-                await self.get_security_count(Market.SH)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                # 心跳失败通常意味着连接已断开
-                # 下一次正常的业务请求或下一次心跳会通过 _execute 触发重连
-                pass
+    def _heartbeat_cmd(self) -> Awaitable[object]:
+        """心跳使用的轻量请求（get_security_count，复用 _execute 重连）。"""
+        return self.get_security_count(Market.SH)
 
     async def _execute(self, cmd: "BaseCommand[_T]") -> _T:
         """执行命令；断线时指数退避重试。"""
@@ -1323,11 +1303,15 @@ class AsyncTdxClient:
         results: list[HistoricalFundFlow] = []
         for bar in bars:
             date = _date_from_bar(bar)
-            records = await self._collect_transaction_records(
-                lambda page_start, page_size: self._execute(
-                    GetHistoryTransactionDataCmd(market, code, date, page_start, page_size)
-                ),
-                800,
-            )
+
+            # 用闭包工厂立即绑定 date（审计 #10），避免 lambda 延迟绑定循环变量。
+            async def _fetch_page(
+                page_start: int, page_size: int, _d: int = date
+            ) -> list[TransactionRecord]:
+                return await self._execute(
+                    GetHistoryTransactionDataCmd(market, code, _d, page_start, page_size)
+                )
+
+            records = await self._collect_transaction_records(_fetch_page, 800)
             results.append(_historical_fund_flow_from_records(date, records))
         return _to_df(results)

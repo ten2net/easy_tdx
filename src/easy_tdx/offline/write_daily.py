@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 from ..models.bar import SecurityBar
@@ -13,6 +15,8 @@ __all__ = [
     "get_last_bar_date",
     "sync_daily_bars_from_security_bars",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -54,10 +58,15 @@ def encode_daily_bar(
 
 
 def get_last_bar_date(filepath: str | Path) -> int | None:
-    """读取 .day 文件最后一条记录的日期。
+    """读取 .day 文件最后一条完整记录的日期（纯读，无副作用）。
+
+    若文件尾部存在不完整记录（size 非 32 的整数倍，通常由上次写入中途崩溃/
+    断电导致），只告警并跳过损坏尾部，返回最后一条完整记录的日期——
+    不修改文件（遵守 command-query separation，"get" 不应写）。
+    损坏尾部的清理由 :func:`_repair_tail` 在写入路径统一完成。
 
     Returns:
-        YYYYMMDD 整数，文件为空或太短时返回 None。
+        YYYYMMDD 整数，文件为空/太短/无完整记录时返回 None。
     """
     filepath = Path(filepath)
     if not filepath.is_file():
@@ -65,11 +74,44 @@ def get_last_bar_date(filepath: str | Path) -> int | None:
     size = filepath.stat().st_size
     if size < _DAILY_FMT.size:
         return None
+    # 完整性检查：非整数倍说明尾部有半条损坏记录，跳过它读最后一条完整记录。
+    remainder = size % _DAILY_FMT.size
+    if remainder != 0:
+        logger.warning(
+            "%s 大小 %d 不是 %d 的整数倍，尾部 %d 字节为损坏记录，"
+            "将读取最后一条完整记录（文件未修改，写入时由 _repair_tail 清理）",
+            filepath,
+            size,
+            _DAILY_FMT.size,
+            remainder,
+        )
+        size -= remainder
+        if size < _DAILY_FMT.size:
+            return None
     with filepath.open("rb") as f:
         f.seek(size - _DAILY_FMT.size)
         last_record = f.read(_DAILY_FMT.size)
     (date_int, *_) = _DAILY_FMT.unpack(last_record)
     return int(date_int)
+
+
+def _repair_tail(filepath: Path) -> None:
+    """截断文件尾部的损坏记录（非整数倍 32 字节的残余）。
+
+    仅在写入路径调用，保证 get_last_bar_date 这类查询函数无副作用（审计 #1）。
+    """
+    if not filepath.is_file():
+        return
+    size = filepath.stat().st_size
+    remainder = size % _DAILY_FMT.size
+    if remainder != 0:
+        logger.warning(
+            "%s 尾部 %d 字节为损坏记录，写入前截断到最后一条完整记录",
+            filepath,
+            remainder,
+        )
+        with filepath.open("r+b") as f:
+            f.truncate(size - remainder)
 
 
 def _bar_date_int(bar: SecurityBar) -> int:
@@ -100,6 +142,9 @@ def append_daily_bars(
     """
     filepath = Path(filepath)
 
+    # 写入前清理上次崩溃可能残留的尾部半条记录（审计 #1）
+    _repair_tail(filepath)
+
     # 获取文件末尾日期，用于去重
     last_date = get_last_bar_date(filepath)
 
@@ -114,6 +159,10 @@ def append_daily_bars(
     encoded = b"".join(encode_daily_bar(b, price_coeff, vol_coeff) for b in new_bars)
     with filepath.open("ab") as f:
         f.write(encoded)
+        # flush + fsync 确保落盘，避免进程崩溃/断电导致文件尾部残留半条记录
+        # （32 字节记录的非原子追加会损坏 get_last_bar_date 的去重依据）。
+        f.flush()
+        os.fsync(f.fileno())
 
     return len(new_bars)
 

@@ -1,0 +1,22 @@
+# 开发工具链锁文件 —— 锁定 dev 依赖的具体版本，保证 CI 构建可复现。
+# 运行时依赖（pandas/tzdata/click 等）由 pyproject.toml 的下界+上界约束，
+# 此文件仅锁定 [dev] 工具链（pytest/mypy/ruff/scipy/coverage 等）。
+# 升级任一工具时请同步更新此文件并重新验证 CI。
+
+# 测试框架
+pytest==8.3.5
+pytest-asyncio>=0.23
+pytest-cov==7.1.0
+coverage==7.14.0
+
+# 静态检查
+mypy==2.1.0
+ruff==0.11.11
+
+# 科学计算（[dev] 与 [science] 可选依赖）
+scipy==1.17.0
+numpy==2.2.3
+
+# Web 可选依赖测试支持
+fastapi==0.115.11
+uvicorn==0.34.0

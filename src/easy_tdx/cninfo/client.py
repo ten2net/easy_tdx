@@ -42,7 +42,7 @@ _ORGID_MAP: dict[str, str] = {}
 
 def _ts_to_date(ts: Any) -> str:
     """巨潮 ``announcementTime`` 返回 Unix 毫秒整数，转 ``YYYY-MM-DD``。"""
-    if isinstance(ts, (int, float)):
+    if isinstance(ts, int | float):
         return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
     return str(ts)[:10] if ts else ""
 

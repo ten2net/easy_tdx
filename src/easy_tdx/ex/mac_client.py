@@ -5,6 +5,9 @@
 """
 
 import asyncio
+import logging
+import time
+from collections.abc import Awaitable
 from datetime import date
 from types import TracebackType
 from typing import Any, TypeVar
@@ -12,6 +15,7 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .._df import _to_df
+from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
 from ..commands.base import BaseCommand
 from ..config import get_best_mac_ex_host, get_mac_ex_hosts, save_best_mac_ex_host
 from ..exceptions import TdxConnectionError
@@ -30,6 +34,8 @@ from .transport.sync import ExTdxConnection, ping_ex_all
 
 _DEFAULT_PORT = 7727
 _T = TypeVar("_T")
+
+logger = logging.getLogger(__name__)
 
 
 def _quotes_to_df(result: list[MacQuoteField]) -> pd.DataFrame:
@@ -135,16 +141,32 @@ class MacExClient:
         self._conn.execute(MacExLoginCmd())
 
     def _execute(self, cmd: "BaseCommand[_T]") -> _T:
+        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。
+
+        每次重连后必须重新 ``_login()``（MAC 协议扩展行情特有）。登录握手期的
+        ``TdxConnectionError`` 与业务请求一样计入退避重试；``TdxCommandError``
+        （登录被拒等确定性失败）不重试，直接抛出。
+        """
         try:
             return self._conn.execute(cmd)
         except TdxConnectionError:
             if not self._auto_reconnect:
                 raise
-            self._conn.close()
-            self._conn = ExTdxConnection(self._host, self._port, self._timeout, mac_ex_mode=True)
-            self._conn.connect()
-            self._login()
-            return self._conn.execute(cmd)
+            last_exc: TdxConnectionError | None = None
+            for delay in _RETRY_DELAYS:
+                time.sleep(delay)
+                self._conn.close()
+                self._conn = ExTdxConnection(
+                    self._host, self._port, self._timeout, mac_ex_mode=True
+                )
+                # connect + login 纳入重试：登录握手期连接再次断开属可重试语义。
+                try:
+                    self._conn.connect()
+                    self._login()
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------ #
     # 商品列表
@@ -419,7 +441,7 @@ class MacExClient:
 # ============================================================
 
 
-class AsyncMacExClient:
+class AsyncMacExClient(AsyncHeartbeatMixin):
     """异步 MAC 协议扩展市场客户端（asyncio，端口 7727）。
 
     使用示例::
@@ -494,50 +516,42 @@ class AsyncMacExClient:
     ) -> None:
         await self.close()
 
-    def _start_heartbeat(self) -> None:
-        if self._heartbeat_interval <= 0:
-            return
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-    async def _stop_heartbeat(self) -> None:
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-
-    async def _heartbeat_loop(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(self._heartbeat_interval)
-                await self._execute(GetExInstrumentCountCmd())
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
+    def _heartbeat_cmd(self) -> Awaitable[object]:
+        """心跳使用的轻量请求（get_instrument_count，复用 _execute 重连）。"""
+        return self._execute(GetExInstrumentCountCmd())
 
     async def _login(self) -> None:
         """执行 MAC EX 登录命令。"""
         await self._conn.execute(MacExLoginCmd())
 
     async def _execute(self, cmd: "BaseCommand[_T]") -> _T:
+        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。
+
+        每次重连后必须重新 ``_login()``（MAC 协议扩展行情特有）。登录握手期的
+        ``TdxConnectionError`` 与业务请求一样计入退避重试；``TdxCommandError``
+        （登录被拒等确定性失败）不重试，直接抛出。
+        """
         async with self._execute_lock:
             try:
                 return await self._conn.execute(cmd)
             except TdxConnectionError:
                 if not self._auto_reconnect:
                     raise
-                await self._conn.close()
-                self._conn = AsyncExTdxConnection(
-                    self._host, self._port, self._timeout, mac_ex_mode=True
-                )
-                await self._conn.connect()
-                await self._login()
-                return await self._conn.execute(cmd)
+                last_exc: TdxConnectionError | None = None
+                for delay in _RETRY_DELAYS:
+                    await asyncio.sleep(delay)
+                    await self._conn.close()
+                    self._conn = AsyncExTdxConnection(
+                        self._host, self._port, self._timeout, mac_ex_mode=True
+                    )
+                    # connect + login 纳入重试：登录握手期连接再次断开属可重试语义。
+                    try:
+                        await self._conn.connect()
+                        await self._login()
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------ #
     # 商品列表

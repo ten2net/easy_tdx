@@ -78,11 +78,39 @@ class OrderSimulator:
             if bar_idx is None:
                 continue
 
-            # 当信号指定了价格（止损/止盈/限价单），
-            # 直接在信号所在 bar 以信号价格成交
-            if signal.price is not None:
-                exec_idx: int = bar_idx
-                price: float = signal.price
+            # 信号成交时点分三类：
+            #  - source="stop"（止损/止盈触发）：延迟到下一根开盘成交，消除"用当根
+            #    intrabar 触发价精确成交"的前视偏差；若下一根跳空，取对持仓者更不利的价。
+            #  - price is not None 且非 stop（限价单）：在信号 bar 当根以信号价成交。
+            #  - 其他（市价策略信号）：按 execution 配置（默认 next_open）在下一根成交。
+            if signal.source == "stop":
+                exec_idx_raw = self._resolve_exec_index(bar_idx)
+                # 下一根不可用时（信号在最后一根 bar 触发），回退到当根收盘成交，
+                # 避免止损信号被静默丢弃（审计 #4：不能因延迟成交而漏平仓）。
+                next_price: float
+                if exec_idx_raw is None or exec_idx_raw >= len(self.df):
+                    exec_idx = bar_idx
+                    row = self.df.iloc[bar_idx] if bar_idx < len(self.df) else None
+                    if row is None:
+                        continue
+                    next_price = float(row["close"])
+                else:
+                    exec_idx = exec_idx_raw
+                    price_raw = self._get_price(exec_idx, signal.direction)
+                    if price_raw is None:
+                        continue
+                    next_price = price_raw
+                # 跳空保护：对 SELL（平仓），若下一根开盘比触发价更不利（更低），
+                # 取实际开盘价；否则按触发价（止损已生效）。
+                trigger = signal.price if signal.price is not None else next_price
+                if signal.direction == "SELL":
+                    price: float = min(next_price, trigger)
+                else:
+                    price = max(next_price, trigger)
+            elif signal.price is not None:
+                # 限价单：在信号所在 bar 以信号价格成交
+                exec_idx = bar_idx
+                price = signal.price
             else:
                 # 确定成交的 K 线索引
                 exec_idx_raw = self._resolve_exec_index(bar_idx)

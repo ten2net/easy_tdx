@@ -6,10 +6,12 @@ from .finance import (
     FinanceInfo,
     FinancialFileInfo,
     FinancialRecord,
+    TdxBlock,
     XdxrRecord,
 )
 from .quote import SecurityQuote
 from .security import SecurityInfo
+from .stats import FundFlow, HistoricalFundFlow, MarketStat
 from .timeseries import MinuteBar, TransactionRecord
 
 __all__ = [
@@ -26,4 +28,8 @@ __all__ = [
     "CompanyInfoCategory",
     "FinancialFileInfo",
     "FinancialRecord",
+    "TdxBlock",
+    "MarketStat",
+    "FundFlow",
+    "HistoricalFundFlow",
 ]
