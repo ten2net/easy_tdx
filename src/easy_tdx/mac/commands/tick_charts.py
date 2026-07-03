@@ -12,6 +12,10 @@ from ...commands.base import BaseCommand
 from ..models import MacMultiTickChart, MacMultiTickDay, MacTick
 
 _MSG_ID = 0x123E
+_TICK_OFFSET = 71
+_TICK_SIZE = struct.calcsize("<HffHH")
+_TAIL_FMT = "<44sBHf5x2I5ffIf12s2fI"
+_TAIL_SIZE = struct.calcsize(_TAIL_FMT)
 
 
 class TickChartsCmd(BaseCommand[MacMultiTickChart]):
@@ -61,15 +65,28 @@ class TickChartsCmd(BaseCommand[MacMultiTickChart]):
         # count(2) + send_last(1) + page_size(2) + total(2)
         (count, send_last, page_size, total) = unpack_from("<HBHH", body, 64, "tick_charts header2")
 
+        max_ticks = max(0, (len(body) - _TICK_OFFSET - _TAIL_SIZE) // _TICK_SIZE)
+        actual_total = min(total, max_ticks)
+        if actual_total >= count * page_size:
+            tick_counts = [page_size] * count
+        else:
+            # start_date=None returns the latest partial trading day first,
+            # followed by complete historical days.
+            complete_days = min(count - 1, actual_total // page_size)
+            first_day_count = actual_total - complete_days * page_size
+            empty_days = count - complete_days - 1
+            tick_counts = [first_day_count] + [page_size] * complete_days + [0] * empty_days
+
         days: list[MacMultiTickDay] = []
-        for d in range(count):
+        tick_index = 0
+        for d, tick_count in enumerate(tick_counts):
             ticks: list[MacTick] = []
-            for t in range(page_size):
-                index = d * page_size + t
-                offset = 71 + index * 14
+            for t in range(tick_count):
+                offset = _TICK_OFFSET + tick_index * _TICK_SIZE
                 (minutes, price, avg, vol, tick_reserved) = unpack_from(
                     "<HffHH", body, offset, f"tick_charts tick[{d}][{t}]"
                 )
+                tick_index += 1
                 ticks.append(
                     MacTick(
                         # 多日分时里 minutes 在个别服务器/数据状态下可能 ≥ 1440
@@ -93,7 +110,7 @@ class TickChartsCmd(BaseCommand[MacMultiTickChart]):
             )
 
         # 尾部元数据
-        tail_offset = 71 + count * page_size * 14
+        tail_offset = _TICK_OFFSET + actual_total * _TICK_SIZE
         (
             name_raw,
             _decimal,
@@ -113,7 +130,7 @@ class TickChartsCmd(BaseCommand[MacMultiTickChart]):
             turnover,
             avg,
             _industry,
-        ) = unpack_from("<44sBHf5x2I5ffIf12s2fI", body, tail_offset, "tick_charts tail")
+        ) = unpack_from(_TAIL_FMT, body, tail_offset, "tick_charts tail")
 
         return MacMultiTickChart(
             market=market,
