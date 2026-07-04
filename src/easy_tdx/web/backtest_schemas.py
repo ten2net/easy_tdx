@@ -275,14 +275,14 @@ class SavedStrategyCreate(BaseModel):
     """
 
     name: str = Field(..., min_length=1, max_length=120, description="策略名称（用户自拟）")
-    kind: Literal["single", "portfolio"] = Field(..., description="来源：单标的/组合")
+    kind: Literal["single", "portfolio", "multi"] = Field(..., description="来源：单标的/组合/多策略组合")
     strategy: str = Field(..., description="策略名（注册表 key，如 ma_cross）")
     strategy_label: str = Field(default="", description="策略展示名")
     params: dict[str, Any] = Field(default_factory=dict)
     context: dict[str, Any] = Field(
         default_factory=dict,
         description="标的上下文：single 存 symbol/category/start_date/end_date；"
-        "portfolio 存 stocks 列表",
+        "portfolio 存 stocks 列表；multi 存 items(MultiStrategyItem[]) + cash/execution",
     )
     trade_config: dict[str, Any] = Field(
         default_factory=dict, description="资金与成本配置（cash/commission/...）"
@@ -299,7 +299,7 @@ class SavedStrategy(BaseModel):
 
     id: str
     name: str
-    kind: Literal["single", "portfolio"]
+    kind: Literal["single", "portfolio", "multi"]
     strategy: str
     strategy_label: str = ""
     params: dict[str, Any] = {}

@@ -269,11 +269,11 @@ export interface ApiError {
 /** 新建一条已保存策略的请求体（前端在回测结果区点「保存」时提交）。 */
 export interface SavedStrategyCreate {
   name: string
-  kind: 'single' | 'portfolio'
+  kind: 'single' | 'portfolio' | 'multi'
   strategy: string
   strategy_label?: string
   params?: Record<string, number | string | boolean>
-  /** 标的上下文：single 存 symbol/category/start_date/end_date；portfolio 存 stocks */
+  /** 标的上下文：single 存 symbol/category/start_date/end_date；portfolio 存 stocks；multi 存 items + cash/execution */
   context?: Record<string, unknown>
   /** 资金与成本配置（cash/commission/...） */
   trade_config?: Record<string, unknown>
@@ -287,7 +287,7 @@ export interface SavedStrategyCreate {
 export interface SavedStrategy {
   id: string
   name: string
-  kind: 'single' | 'portfolio'
+  kind: 'single' | 'portfolio' | 'multi'
   strategy: string
   strategy_label: string
   params: Record<string, number | string | boolean>
