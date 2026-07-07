@@ -485,6 +485,7 @@ def _fetch_all_daily_bars(
     code: str,
     need_full: bool = False,
     is_index: bool = False,
+    max_retries: int = 3,
 ) -> list[SecurityBar]:
     """从服务端分页获取全部日线数据。
 
@@ -495,11 +496,21 @@ def _fetch_all_daily_bars(
         need_full: True 表示拉取全量历史（空文件场景），
                    False 表示只拉最近一页（增量更新）。
         is_index: True 表示指数，使用 get_index_bars()。
+        max_retries: 单页失败时的最大重试次数（默认 3）。
 
     Returns:
         SecurityBar 列表（按日期升序）。
+
+    Raises:
+        TdxDecodeError: 单页重试耗尽仍失败时抛出，附带页码与 start 信息。
     """
+    import logging
+    import time
+
+    from ..exceptions import TdxDecodeError
     from ..models.enums import KlineCategory, Market
+
+    logger = logging.getLogger(__name__)
 
     mkt = Market(market)
     fetch_fn = client.get_index_bars if is_index else client.get_security_bars
@@ -509,8 +520,31 @@ def _fetch_all_daily_bars(
     page_size = 800
     max_pages = 50 if need_full else 1  # 50 页 = 40000 条，足够覆盖 A 股全部历史
 
-    for _ in range(max_pages):
-        df = fetch_fn(mkt, code, KlineCategory.DAY, start, page_size)
+    for page in range(max_pages):
+        df = None
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                df = fetch_fn(mkt, code, KlineCategory.DAY, start, page_size)
+                break
+            except Exception as e:  # noqa: BLE001 - 网络/解析异常均需重试
+                last_error = e
+                if attempt < max_retries:
+                    wait = 0.5 * (2**attempt)
+                    logger.warning(
+                        "日线分页拉取失败，第 %d 页 start=%d，%d 秒后第 %d 次重试: %s",
+                        page + 1,
+                        start,
+                        wait,
+                        attempt + 1,
+                        e,
+                    )
+                    time.sleep(wait)
+        if df is None:
+            raise TdxDecodeError(
+                f"日线数据第 {page + 1} 页拉取失败"
+                f"（start={start}，重试 {max_retries} 次）: {last_error}"
+            ) from last_error
         if df.empty:
             break
         all_bars.extend(_df_to_bars(df))
