@@ -37,11 +37,13 @@ def detect_tdx_home() -> Path | None:
     return None
 
 
-def resolve_vipdoc(path: str | Path | None = None) -> Path:
+def resolve_vipdoc(path: str | Path | None = None, *, create: bool = False) -> Path:
     """解析 vipdoc 数据目录。
 
     Args:
         path: 显式指定的 vipdoc 路径。为 None 时自动检测。
+        create: 显式指定路径且目录不存在时是否自动创建（默认 False）。
+            自动检测模式下不会创建目录，避免在无关位置生成文件夹。
 
     Returns:
         vipdoc 目录的 Path 对象。
@@ -52,6 +54,9 @@ def resolve_vipdoc(path: str | Path | None = None) -> Path:
     if path is not None:
         p = Path(path)
         if p.is_dir():
+            return p
+        if create:
+            p.mkdir(parents=True, exist_ok=True)
             return p
         raise TdxOfflineError(f"指定的 vipdoc 路径不存在: {p}")
     home = detect_tdx_home()

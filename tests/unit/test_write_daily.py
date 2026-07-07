@@ -57,7 +57,7 @@ def _make_raw_bar(
     low_int: int = 1010,
     close_int: int = 1030,
     amount: float = 1025000.0,
-    vol_int: int = 100000,
+    vol_int: int = 1000,
     reserved: int = 0,
 ) -> bytes:
     """直接用原始整数构造一条 32 字节 .day 记录。"""
@@ -121,6 +121,17 @@ class TestEncodeDailyBar:
         vol_int = struct.unpack_from("<I", result, 24)[0]
         assert vol_int == 123456789
 
+    def test_volume_encoding_large_a_stock(self) -> None:
+        """大成交量 A 股：vol_coeff=100.0（手 → 股）不应溢出 uint32。
+
+        回归：万科 A 等大盘股日成交量可达数亿股，旧实现使用 0.01 会让
+        vol_int = vol * 100，超过 2^32-1 触发 struct.error。
+        """
+        bar = _make_bar(vol=100_000_000.0)  # 1 亿股
+        result = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=100.0)
+        vol_int = struct.unpack_from("<I", result, 24)[0]
+        assert vol_int == 1_000_000  # 1 亿股 / 100 = 100 万手
+
     def test_amount_as_float32(self) -> None:
         bar = _make_bar(amount=1_025_000.0)
         result = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=0.01)
@@ -146,7 +157,7 @@ class TestRoundTrip:
         bar = _make_bar(
             open_=10.25, high=10.50, low=10.10, close=10.30, vol=100000.0, amount=1025000.0
         )
-        encoded = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=0.01)
+        encoded = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=100.0)
 
         filepath = tmp_path / "sh600000.day"
         filepath.write_bytes(encoded)
@@ -169,7 +180,7 @@ class TestRoundTrip:
             _make_bar(year=2026, month=6, day=5, open_=10.1, close=10.2),
             _make_bar(year=2026, month=6, day=6, open_=10.2, close=10.3),
         ]
-        encoded = b"".join(encode_daily_bar(b, price_coeff=0.01, vol_coeff=0.01) for b in bars_in)
+        encoded = b"".join(encode_daily_bar(b, price_coeff=0.01, vol_coeff=100.0) for b in bars_in)
 
         filepath = tmp_path / "sh600000.day"
         filepath.write_bytes(encoded)
@@ -180,9 +191,9 @@ class TestRoundTrip:
         assert bars_out[2].day == 6
 
     def test_index_round_trip(self, tmp_path: Path) -> None:
-        """指数：价格系数 0.01，量系数 1.0。"""
+        """指数：价格系数 0.01，量系数 100.0。"""
         bar = _make_bar(open_=3250.18, close=3260.5, vol=123456789.0)
-        encoded = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=1.0)
+        encoded = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=100.0)
 
         filepath = tmp_path / "sh000001.day"
         filepath.write_bytes(encoded)
@@ -190,7 +201,7 @@ class TestRoundTrip:
         bars = read_daily_bars(filepath)
         assert len(bars) == 1
         assert abs(bars[0].open - 3250.18) < 0.01
-        assert abs(bars[0].vol - 123456789.0) < 1.0
+        assert abs(bars[0].vol - 123456789.0) < 100.0  # 手 → 股，允许 ±50 股舍入
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +247,7 @@ class TestAppendDailyBars:
         filepath.write_bytes(_make_raw_bar(year=2026, month=6, day=5))
 
         new_bar = _make_bar(year=2026, month=6, day=6, open_=10.3, close=10.4)
-        append_daily_bars(filepath, [new_bar], price_coeff=0.01, vol_coeff=0.01)
+        append_daily_bars(filepath, [new_bar], price_coeff=0.01, vol_coeff=100.0)
 
         bars = read_daily_bars(filepath)
         assert len(bars) == 2
@@ -248,7 +259,7 @@ class TestAppendDailyBars:
         filepath.write_bytes(b"")
 
         new_bar = _make_bar(year=2026, month=6, day=6)
-        append_daily_bars(filepath, [new_bar], price_coeff=0.01, vol_coeff=0.01)
+        append_daily_bars(filepath, [new_bar], price_coeff=0.01, vol_coeff=100.0)
 
         bars = read_daily_bars(filepath)
         assert len(bars) == 1
@@ -259,7 +270,7 @@ class TestAppendDailyBars:
         filepath.write_bytes(_make_raw_bar(year=2026, month=6, day=6))
 
         new_bar = _make_bar(year=2026, month=6, day=6)  # same date
-        written = append_daily_bars(filepath, [new_bar], price_coeff=0.01, vol_coeff=0.01)
+        written = append_daily_bars(filepath, [new_bar], price_coeff=0.01, vol_coeff=100.0)
         assert written == 0  # skipped
 
         bars = read_daily_bars(filepath)
@@ -274,7 +285,7 @@ class TestAppendDailyBars:
             _make_bar(year=2026, month=6, day=6),  # new
             _make_bar(year=2026, month=6, day=7),  # new
         ]
-        written = append_daily_bars(filepath, bars_to_append, price_coeff=0.01, vol_coeff=0.01)
+        written = append_daily_bars(filepath, bars_to_append, price_coeff=0.01, vol_coeff=100.0)
         assert written == 2
 
         bars = read_daily_bars(filepath)
@@ -306,7 +317,7 @@ class TestSyncDailyBars:
         ]
 
         written = sync_daily_bars_from_security_bars(
-            filepath, server_bars, price_coeff=0.01, vol_coeff=0.01
+            filepath, server_bars, price_coeff=0.01, vol_coeff=100.0
         )
         assert written == 2  # only 6/6 and 6/7
 
@@ -323,7 +334,7 @@ class TestSyncDailyBars:
         ]
 
         written = sync_daily_bars_from_security_bars(
-            filepath, server_bars, price_coeff=0.01, vol_coeff=0.01
+            filepath, server_bars, price_coeff=0.01, vol_coeff=100.0
         )
         assert written == 2
 
@@ -340,6 +351,30 @@ class TestSyncDailyBars:
         ]
 
         written = sync_daily_bars_from_security_bars(
-            filepath, server_bars, price_coeff=0.01, vol_coeff=0.01
+            filepath, server_bars, price_coeff=0.01, vol_coeff=100.0
         )
         assert written == 0
+
+
+# ---------------------------------------------------------------------------
+# coefficients
+# ---------------------------------------------------------------------------
+
+
+class TestSecurityCoefficients:
+    """证券类型系数回归测试。"""
+
+    def test_a_stock_vol_coefficient_is_hand_to_share(self) -> None:
+        """A 股成交量系数应为 100.0（.day 文件存"手"，SecurityBar.vol 用"股"）。"""
+        from easy_tdx.offline.daily_bar import _SECURITY_COEFFICIENTS
+
+        price_coeff, vol_coeff = _SECURITY_COEFFICIENTS["SZ_A_STOCK"]
+        assert price_coeff == 0.01
+        assert vol_coeff == 100.0
+
+    def test_all_coefficients_use_hand_for_volume(self) -> None:
+        """所有证券类型的成交量系数都应为 100.0，避免大成交量溢出。"""
+        from easy_tdx.offline.daily_bar import _SECURITY_COEFFICIENTS
+
+        for sec_type, (_, vol_coeff) in _SECURITY_COEFFICIENTS.items():
+            assert vol_coeff == 100.0, f"{sec_type} 的 vol_coeff 应为 100.0"

@@ -1466,7 +1466,7 @@ from easy_tdx.client import TdxClient
 from easy_tdx.offline import sync_daily_bars_from_security_bars
 
 # 手动编码单条记录
-bar_bytes = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=0.01)
+bar_bytes = encode_daily_bar(bar, price_coeff=0.01, vol_coeff=100.0)
 
 # 获取文件末尾日期
 last_date = get_last_bar_date("C:/new_jyplug/vipdoc/sh/lday/sh600000.day")

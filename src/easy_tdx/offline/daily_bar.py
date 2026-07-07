@@ -12,17 +12,20 @@ from .paths import _market_to_exchange, resolve_vipdoc
 _DAILY_FMT = struct.Struct("<IIIIIfII")
 
 # 证券类型 → (价格系数, 量系数)
+# 价格系数：.day 文件中价格以"分/厘"等整数存储，转换为浮点价格时使用。
+# 量系数：.day 文件中成交量以"手"为单位存储（1 手 = 100 股），SecurityBar.vol
+#         使用"股"为单位，因此统一用 100.0（手 → 股）进行换算。
 _SECURITY_COEFFICIENTS: dict[str, tuple[float, float]] = {
-    "SH_A_STOCK": (0.01, 0.01),
-    "SH_B_STOCK": (0.001, 0.01),
-    "SH_INDEX": (0.01, 1.0),
-    "SH_FUND": (0.001, 1.0),
-    "SH_BOND": (0.001, 1.0),
-    "SZ_A_STOCK": (0.01, 0.01),
-    "SZ_B_STOCK": (0.01, 0.01),
-    "SZ_INDEX": (0.01, 1.0),
-    "SZ_FUND": (0.001, 0.01),
-    "SZ_BOND": (0.001, 1.0),
+    "SH_A_STOCK": (0.01, 100.0),
+    "SH_B_STOCK": (0.001, 100.0),
+    "SH_INDEX": (0.01, 100.0),
+    "SH_FUND": (0.001, 100.0),
+    "SH_BOND": (0.001, 100.0),
+    "SZ_A_STOCK": (0.01, 100.0),
+    "SZ_B_STOCK": (0.01, 100.0),
+    "SZ_INDEX": (0.01, 100.0),
+    "SZ_FUND": (0.001, 100.0),
+    "SZ_BOND": (0.001, 100.0),
 }
 
 
@@ -86,7 +89,7 @@ def read_daily_bars(filepath: str | Path) -> list[SecurityBar]:
         raise TdxFileNotFoundError(f"日线数据文件不存在: {filepath}")
 
     sec_type = _detect_security_type(filepath.name)
-    price_coeff, vol_coeff = _SECURITY_COEFFICIENTS.get(sec_type, (0.01, 0.01))
+    price_coeff, vol_coeff = _SECURITY_COEFFICIENTS.get(sec_type, (0.01, 100.0))
 
     data = filepath.read_bytes()
     if len(data) < _DAILY_FMT.size:
@@ -126,6 +129,8 @@ def find_daily_bar_file(
     market: int,
     code: str,
     vipdoc: str | Path | None = None,
+    *,
+    create: bool = False,
 ) -> Path:
     """根据市场和代码定位日线文件路径。
 
@@ -133,10 +138,14 @@ def find_daily_bar_file(
         market: 市场代码（Market.SZ=0, Market.SH=1）。
         code: 6 位股票代码。
         vipdoc: vipdoc 目录路径，None 则自动检测。
+        create: 显式指定 vipdoc 且目录不存在时是否自动创建（默认 False）。
 
     Returns:
         .day 文件的 Path。
     """
-    vipdoc_path = resolve_vipdoc(vipdoc)
+    vipdoc_path = resolve_vipdoc(vipdoc, create=create)
     exchange = _market_to_exchange(market)
-    return vipdoc_path / exchange / "lday" / f"{exchange}{code}.day"
+    filepath = vipdoc_path / exchange / "lday" / f"{exchange}{code}.day"
+    if create:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+    return filepath

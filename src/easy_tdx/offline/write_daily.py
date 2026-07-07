@@ -34,7 +34,8 @@ def encode_daily_bar(
     Args:
         bar: K 线数据（open/close/high/low 为实际价格，非整数）。
         price_coeff: 价格系数（A 股 0.01，基金 0.001 等）。
-        vol_coeff: 成交量系数（A 股 0.01，指数 1.0 等）。
+        vol_coeff: 成交量系数（.day 文件以"手"为单位，SecurityBar.vol 以"股"
+            为单位，故正常情况使用 100.0）。
 
     Returns:
         32 字节的二进制记录。

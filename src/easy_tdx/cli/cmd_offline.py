@@ -555,7 +555,7 @@ def _sync_one_daily(client: TdxClient, filepath: Path) -> tuple[int, str]:
 
     # 检测证券类型获取系数
     sec_type = _detect_security_type(filepath.name)
-    price_coeff, vol_coeff = _SECURITY_COEFFICIENTS.get(sec_type, (0.01, 0.01))
+    price_coeff, vol_coeff = _SECURITY_COEFFICIENTS.get(sec_type, (0.01, 100.0))
 
     # 追加写入
     written = append_daily_bars(filepath, bars, price_coeff, vol_coeff)
@@ -592,7 +592,7 @@ def sync_daily(market: str, code: str, vipdoc: str | None) -> None:
     mkt = parse_market(market)
 
     try:
-        filepath = find_daily_bar_file(mkt, code, vipdoc)
+        filepath = find_daily_bar_file(mkt, code, vipdoc, create=True)
         click.echo(f"目标文件: {filepath}")
 
         click.echo("正在连接服务端获取日线数据...")
@@ -637,7 +637,7 @@ def sync_all(vipdoc: str | None) -> None:
     from ..offline.paths import resolve_vipdoc
 
     try:
-        vipdoc_path = resolve_vipdoc(vipdoc)
+        vipdoc_path = resolve_vipdoc(vipdoc, create=True)
     except Exception as e:
         click.echo(f"✗ {e}", err=True)
         raise SystemExit(1)
