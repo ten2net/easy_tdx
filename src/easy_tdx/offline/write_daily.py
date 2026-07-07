@@ -5,15 +5,19 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Literal
 
 from ..models.bar import SecurityBar
-from .daily_bar import _DAILY_FMT
+from .daily_bar import _DAILY_FMT, _SECURITY_COEFFICIENTS, _detect_security_type, read_daily_bars
 
 __all__ = [
     "encode_daily_bar",
     "append_daily_bars",
     "get_last_bar_date",
     "sync_daily_bars_from_security_bars",
+    "merge_daily_bars",
+    "write_daily_bars",
+    "sync_bidirectional_daily",
 ]
 
 logger = logging.getLogger(__name__)
@@ -193,3 +197,162 @@ def sync_daily_bars_from_security_bars(
         实际写入的记录数。
     """
     return append_daily_bars(filepath, server_bars, price_coeff, vol_coeff)
+
+
+# ---------------------------------------------------------------------------
+# bidirectional sync
+# ---------------------------------------------------------------------------
+
+
+def merge_daily_bars(
+    left: list[SecurityBar],
+    right: list[SecurityBar],
+    prefer: Literal["left", "right", "both"] = "left",
+) -> list[SecurityBar]:
+    """合并两组日线 bar，按日期去重并升序排列。
+
+    Args:
+        left: 左侧 bar 列表（已按日期升序）。
+        right: 右侧 bar 列表（已按日期升序）。
+        prefer: 同一日期两侧均存在时的处理策略。
+            "left" 保留左侧，"right" 保留右侧，"both" 保留左侧（理论上同日期数据应一致，
+            仅做补齐不主动覆盖）。
+
+    Returns:
+        合并后的 bar 列表（按日期升序）。
+    """
+    left_map = {_bar_date_int(b): b for b in left}
+    right_map = {_bar_date_int(b): b for b in right}
+    all_dates = sorted(set(left_map) | set(right_map))
+
+    merged: list[SecurityBar] = []
+    for d in all_dates:
+        if d in left_map and d in right_map:
+            if prefer == "right":
+                merged.append(right_map[d])
+            else:
+                merged.append(left_map[d])
+        elif d in left_map:
+            merged.append(left_map[d])
+        else:
+            merged.append(right_map[d])
+    return merged
+
+
+def write_daily_bars(
+    filepath: str | Path,
+    bars: list[SecurityBar],
+    price_coeff: float,
+    vol_coeff: float,
+) -> int:
+    """覆盖写入 .day 文件（合并场景需要全量重写，而非追加）。
+
+    Args:
+        filepath: 目标 .day 文件路径，父目录不存在时自动创建。
+        bars: 待写入的 K 线列表（按时间升序）。
+        price_coeff: 价格系数。
+        vol_coeff: 成交量系数。
+
+    Returns:
+        实际写入的记录数。
+    """
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    if not bars:
+        filepath.write_bytes(b"")
+        return 0
+
+    encoded = b"".join(encode_daily_bar(b, price_coeff, vol_coeff) for b in bars)
+    with filepath.open("wb") as f:
+        f.write(encoded)
+        f.flush()
+        os.fsync(f.fileno())
+
+    return len(bars)
+
+
+def sync_bidirectional_daily(
+    src_file: Path,
+    dst_file: Path,
+    prefer: str = "newer",
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """双向同步两个 .day 文件，使两侧最终数据一致。
+
+    Args:
+        src_file: 源侧 .day 文件路径。
+        dst_file: 目标侧 .day 文件路径。
+        prefer: 冲突解决策略。
+            - "src"/"dst"：冲突日期保留对应侧。
+            - "newer"（默认）：保留文件最后日期较新的一侧。
+            - "both"：不主动覆盖冲突日期，仅补齐缺失日期。
+        dry_run: True 时只计算差异，不写入文件。
+
+    Returns:
+        统计字典，包含：
+        - src_to_dst_added: 从 src 补齐到 dst 的记录数
+        - dst_to_src_added: 从 dst 补齐到 src 的记录数
+        - conflicts: 两侧都有的日期数量
+        - total: 合并后总记录数
+    """
+    sec_type = _detect_security_type(src_file.name)
+    price_coeff, vol_coeff = _SECURITY_COEFFICIENTS.get(sec_type, (0.01, 100.0))
+
+    src_bars = read_daily_bars(src_file) if src_file.is_file() else []
+    dst_bars = read_daily_bars(dst_file) if dst_file.is_file() else []
+
+    src_dates = {_bar_date_int(b) for b in src_bars}
+    dst_dates = {_bar_date_int(b) for b in dst_bars}
+
+    # 决定冲突时优先保留哪一侧
+    prefer_side: Literal["left", "right", "both"]
+    if prefer == "newer":
+        src_last = _bar_date_int(src_bars[-1]) if src_bars else 0
+        dst_last = _bar_date_int(dst_bars[-1]) if dst_bars else 0
+        prefer_side = "left" if src_last >= dst_last else "right"
+    elif prefer == "src":
+        prefer_side = "left"
+    elif prefer == "dst":
+        prefer_side = "right"
+    else:  # both
+        prefer_side = "left"
+
+    merged = merge_daily_bars(src_bars, dst_bars, prefer=prefer_side)
+    merged_dates = {_bar_date_int(b) for b in merged}
+
+    stats = {
+        "src_to_dst_added": len(merged_dates - dst_dates),
+        "dst_to_src_added": len(merged_dates - src_dates),
+        "conflicts": len(src_dates & dst_dates),
+        "total": len(merged),
+    }
+
+    if dry_run:
+        return stats
+
+    # 只有当两侧确实需要更新时才写入，避免无意义的 fsync
+    src_needs_write = _bars_changed(src_bars, merged)
+    dst_needs_write = _bars_changed(dst_bars, merged)
+
+    if src_needs_write:
+        write_daily_bars(src_file, merged, price_coeff, vol_coeff)
+    if dst_needs_write:
+        write_daily_bars(dst_file, merged, price_coeff, vol_coeff)
+
+    return stats
+
+
+def _bars_changed(
+    original: list[SecurityBar],
+    merged: list[SecurityBar],
+) -> bool:
+    """Return whether merged data differs from original (compare date and raw bytes)."""
+    if len(original) != len(merged):
+        return True
+    for orig_bar, merged_bar in zip(original, merged):
+        if _bar_date_int(orig_bar) != _bar_date_int(merged_bar):
+            return True
+        if getattr(orig_bar, "_raw", None) != getattr(merged_bar, "_raw", None):
+            return True
+    return False

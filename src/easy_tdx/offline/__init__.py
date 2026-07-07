@@ -12,7 +12,10 @@ from .write_daily import (
     append_daily_bars,
     encode_daily_bar,
     get_last_bar_date,
+    merge_daily_bars,
+    sync_bidirectional_daily,
     sync_daily_bars_from_security_bars,
+    write_daily_bars,
 )
 from .write_ex_daily import (
     append_ex_daily_bars,
@@ -41,6 +44,9 @@ __all__ = [
     "append_daily_bars",
     "get_last_bar_date",
     "sync_daily_bars_from_security_bars",
+    "merge_daily_bars",
+    "write_daily_bars",
+    "sync_bidirectional_daily",
     # 扩展市场日线写入
     "encode_ex_daily_bar",
     "append_ex_daily_bars",

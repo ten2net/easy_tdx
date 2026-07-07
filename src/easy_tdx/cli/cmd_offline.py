@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -653,10 +654,43 @@ def sync_daily(market: str, code: str, vipdoc: str | None) -> None:
 
 @offline.command("sync-all")
 @click.option("--vipdoc", default=None, help="vipdoc 目录路径（默认自动检测）")
-def sync_all(vipdoc: str | None) -> None:
+@click.option(
+    "--peer",
+    default=None,
+    help="对端 vipdoc 目录路径。指定后执行本地双向同步，不连接服务端",
+)
+@click.option(
+    "--prefer",
+    type=click.Choice(["src", "dst", "newer", "both"]),
+    default="newer",
+    help="两侧同一日期都有数据时的冲突策略（默认 newer=保留更新的一侧）",
+)
+@click.option("--dry-run", is_flag=True, help="预览变更，不写入文件（仅 --peer 模式）")
+@click.option(
+    "--all-stocks",
+    "all_stocks",
+    is_flag=True,
+    help="获取沪深全市场 A 股列表，本地缺失的股票自动创建文件并全量下载",
+)
+def sync_all(
+    vipdoc: str | None,
+    peer: str | None,
+    prefer: str,
+    dry_run: bool,
+    all_stocks: bool,
+) -> None:
     """一键同步全部本地日线数据（沪深全市场）。
 
-    扫描 vipdoc 下所有 .day 文件，自动连接服务端获取最新数据并追加写入。
+    默认行为：扫描 vipdoc 下所有 .day 文件，连接服务端获取最新数据并追加写入。
+
+    当指定 --all-stocks 时，改为从服务端获取沪深全部 A 股列表：
+    本地已存在的文件做增量更新，本地不存在的文件自动创建并全量下载。
+
+    当指定 --peer 时，改为在两个本地 vipdoc 目录之间做双向同步：
+    互相复制缺失的文件，并对两侧都存在的股票按日期合并补齐。
+
+    --peer 与 --all-stocks 不能同时使用。
+
     建议在通达信关闭时执行，避免文件被锁定。
 
     示例：
@@ -664,45 +698,203 @@ def sync_all(vipdoc: str | None) -> None:
       easy-tdx offline sync-all
 
       easy-tdx offline sync-all --vipdoc C:\\new_jyplug\\vipdoc
-    """
-    import time
 
-    from ..client import TdxClient
+      easy-tdx offline sync-all --all-stocks
+
+      easy-tdx offline sync-all --vipdoc C:\\new_jyplug\\vipdoc --all-stocks
+
+      easy-tdx offline sync-all --peer C:\\new_tdx\\vipdoc
+    """
     from ..offline.paths import resolve_vipdoc
 
+    if peer is not None and all_stocks:
+        raise click.BadParameter("--peer 与 --all-stocks 不能同时使用")
+
     try:
-        vipdoc_path = resolve_vipdoc(vipdoc, create=True)
+        vipdoc_path = resolve_vipdoc(vipdoc, create=all_stocks)
     except Exception as e:
         click.echo(f"✗ {e}", err=True)
         raise SystemExit(1)
 
-    # 1. 扫描所有 .day 文件
-    all_files: list[Path] = []
+    if peer is not None:
+        try:
+            peer_path = resolve_vipdoc(peer, create=False)
+        except Exception as e:
+            click.echo(f"✗ 对端目录错误: {e}", err=True)
+            raise SystemExit(1)
+        _sync_all_bidirectional(vipdoc_path, peer_path, prefer, dry_run)
+        return
+
+    _sync_all_remote(vipdoc_path, all_stocks)
+
+
+def _collect_daily_files(vipdoc_path: Path) -> dict[str, Path]:
+    """收集 vipdoc 目录下所有 .day 文件，返回 {小写文件名: 路径}。"""
+    files: dict[str, Path] = {}
     for exchange in ("sh", "sz"):
         lday_dir = vipdoc_path / exchange / "lday"
         if lday_dir.is_dir():
-            all_files.extend(sorted(lday_dir.glob("*.day")))
+            for f in lday_dir.glob("*.day"):
+                files[f.name.lower()] = f
+    return files
 
-    if not all_files:
+
+def _copy_to_vipdoc(src_file: Path, dst_vipdoc: Path, dry_run: bool) -> Path:
+    """把单个 .day 文件复制到目标 vipdoc 目录的对应位置。"""
+    exchange = src_file.name[:2].lower()
+    dst_file = dst_vipdoc / exchange / "lday" / src_file.name
+    if not dry_run:
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, dst_file)
+    return dst_file
+
+
+def _sync_all_bidirectional(
+    src_vipdoc: Path,
+    dst_vipdoc: Path,
+    prefer: str,
+    dry_run: bool,
+) -> None:
+    """两个本地 vipdoc 目录之间的双向同步。"""
+    from ..offline import sync_bidirectional_daily
+
+    src_files = _collect_daily_files(src_vipdoc)
+    dst_files = _collect_daily_files(dst_vipdoc)
+    all_keys = sorted(set(src_files) | set(dst_files))
+
+    if not all_keys:
         click.echo("未找到任何 .day 文件，请确认 vipdoc 路径正确")
         raise SystemExit(0)
 
-    total = len(all_files)
-    click.echo(f"发现 {total} 个 .day 文件，开始同步...")
+    total = len(all_keys)
+    mode_prefix = "[预览] " if dry_run else ""
+    click.echo(f"{mode_prefix}发现 {total} 只股票，开始在两个本地目录间双向同步...")
 
-    # 2. 连接服务端，逐个同步
-    success = 0
-    skipped = 0
+    src_to_dst_files = 0
+    dst_to_src_files = 0
+    merged_files = 0
+    identical_files = 0
     failed = 0
-    total_written = 0
+    src_to_dst_bars = 0
+    dst_to_src_bars = 0
 
+    for idx, key in enumerate(all_keys, 1):
+        src_file = src_files.get(key)
+        dst_file = dst_files.get(key)
+        try:
+            if src_file is None:
+                # 仅对端有，复制到本端
+                assert dst_file is not None
+                if not dry_run:
+                    _copy_to_vipdoc(dst_file, src_vipdoc, dry_run)
+                dst_to_src_files += 1
+                click.echo(f"  [{idx}/{total}] {key}: {mode_prefix}dst -> src")
+                continue
+
+            if dst_file is None:
+                # 仅本端有，复制到对端
+                assert src_file is not None
+                if not dry_run:
+                    _copy_to_vipdoc(src_file, dst_vipdoc, dry_run)
+                src_to_dst_files += 1
+                click.echo(f"  [{idx}/{total}] {key}: {mode_prefix}src -> dst")
+                continue
+
+            # 两侧都有：按日期合并
+            stats = sync_bidirectional_daily(src_file, dst_file, prefer, dry_run)
+            added_total = stats["src_to_dst_added"] + stats["dst_to_src_added"]
+            src_to_dst_bars += stats["src_to_dst_added"]
+            dst_to_src_bars += stats["dst_to_src_added"]
+
+            if added_total == 0 and stats["conflicts"] == 0:
+                identical_files += 1
+                msg = "一致"
+            else:
+                merged_files += 1
+                msg = f"合并 +{added_total}"
+            click.echo(f"  [{idx}/{total}] {key}: {mode_prefix}{msg}")
+
+        except PermissionError:
+            failed += 1
+            click.echo(f"  [{idx}/{total}] {key}: {mode_prefix}✗ 文件被锁定", err=True)
+        except Exception as e:
+            failed += 1
+            click.echo(f"  [{idx}/{total}] {key}: {mode_prefix}✗ {e}", err=True)
+
+    click.echo("")
+    summary = (
+        f"{mode_prefix}双向同步完成: {total} 只 | "
+        f"src→dst 复制 {src_to_dst_files} | "
+        f"dst→src 复制 {dst_to_src_files} | "
+        f"合并 {merged_files} | "
+        f"一致 {identical_files} | "
+        f"失败 {failed} | "
+        f"共补齐 {src_to_dst_bars + dst_to_src_bars} 条"
+    )
+    click.echo(summary)
+
+
+def _sync_all_remote(vipdoc_path: Path, all_stocks: bool = False) -> None:
+    """从服务端拉取最新数据并追加到本地 .day 文件。"""
+    import time
+
+    from ..client import TdxClient
+    from ..offline import find_daily_bar_file
+
+    # 1. 确定待同步文件列表
     with TdxClient.from_best_host() as client:
+        if all_stocks:
+            click.echo("正在从服务端获取沪深 A 股全市场列表...")
+
+            def _progress(market: str, page: int, total: int, count: int) -> None:
+                if count < 0:
+                    click.echo(f"  获取 {market} 第 {page}/{total} 页失败，跳过")
+                else:
+                    click.echo(f"  获取 {market} 第 {page}/{total} 页，{count} 条")
+
+            stocks_df = client.get_security_list_all(progress_callback=_progress)
+            all_files: list[Path] = []
+            seen: set[str] = set()
+            for _, row in stocks_df.iterrows():
+                # pandas 会把 Market 枚举转成 int，这里直接用 int
+                market = int(row["market"])
+                code = str(row["code"])
+                filepath = find_daily_bar_file(market, code, vipdoc_path, create=True)
+                key = filepath.name.lower()
+                if key not in seen:
+                    seen.add(key)
+                    all_files.append(filepath)
+            all_files.sort(key=lambda p: p.name)
+            click.echo(f"全市场共 {len(all_files)} 只 A 股，开始同步...")
+        else:
+            all_files = []
+            for exchange in ("sh", "sz"):
+                lday_dir = vipdoc_path / exchange / "lday"
+                if lday_dir.is_dir():
+                    all_files.extend(sorted(lday_dir.glob("*.day")))
+            if not all_files:
+                click.echo("未找到任何 .day 文件，请确认 vipdoc 路径正确")
+                raise SystemExit(0)
+            click.echo(f"发现 {len(all_files)} 个 .day 文件，开始同步...")
+
+        total = len(all_files)
+
+        # 2. 逐个同步
+        success = 0
+        skipped = 0
+        failed = 0
+        created = 0
+        total_written = 0
+
         for idx, filepath in enumerate(all_files, 1):
             name = filepath.name
+            is_new = not filepath.is_file()
             try:
                 written, msg = _sync_one_daily(client, filepath)
                 total_written += written
-                if written > 0:
+                if is_new and written > 0:
+                    created += 1
+                elif written > 0:
                     success += 1
                 else:
                     skipped += 1
@@ -720,9 +912,16 @@ def sync_all(vipdoc: str | None) -> None:
 
     # 3. 汇总
     click.echo("")
-    summary = (
-        f"同步完成: {total} 只 | "
-        f"更新 {success} | 已是最新 {skipped} | "
-        f"失败 {failed} | 共写入 {total_written} 条"
-    )
+    if all_stocks:
+        summary = (
+            f"同步完成: {total} 只 | "
+            f"新建 {created} | 更新 {success} | 已是最新 {skipped} | "
+            f"失败 {failed} | 共写入 {total_written} 条"
+        )
+    else:
+        summary = (
+            f"同步完成: {total} 只 | "
+            f"更新 {success} | 已是最新 {skipped} | "
+            f"失败 {failed} | 共写入 {total_written} 条"
+        )
     click.echo(summary)

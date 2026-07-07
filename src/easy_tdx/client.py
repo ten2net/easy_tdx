@@ -349,13 +349,20 @@ class TdxClient:
         """获取证券列表（每页约1000条，按 start 分页）。"""
         return _to_df(self._execute(GetSecurityListCmd(market, start)))
 
-    def get_security_list_all(self, pages: int | str = "all") -> pd.DataFrame:
+    def get_security_list_all(
+        self,
+        pages: int | str = "all",
+        progress_callback: Callable[[str, int, int, int], None] | None = None,
+    ) -> pd.DataFrame:
         """获取沪深 A 股完整证券列表，并自动挂载行业信息。
 
         Args:
             pages: 拉取页数。每个市场每页 1000 条。
                    "all" 拉取全部（默认，结果会缓存到本地文件）。
                    整数 N 表示每个市场只拉前 N 页，不缓存。
+            progress_callback: 可选进度回调，签名为
+                ``callback(market_name, page, total_pages, count)``。
+                ``count`` 为本次拉取到的记录数，-1 表示该页失败。
 
         注意：
             `Market.BJ` 的证券列表请求长期存在服务器超时问题，当前版本暂不纳入此方法。
@@ -396,10 +403,14 @@ class TdxClient:
                     log.warning(
                         "%s 第 %d/%d 页获取失败，跳过", market.name, page_idx + 1, total_pages
                     )
+                    if progress_callback is not None:
+                        progress_callback(market.name, page_idx + 1, total_pages, -1)
                     continue
                 log.info(
                     "%s 第 %d/%d 页: %d 条", market.name, page_idx + 1, total_pages, len(stocks)
                 )
+                if progress_callback is not None:
+                    progress_callback(market.name, page_idx + 1, total_pages, len(stocks))
                 for s in stocks:
                     is_a_share = (market == Market.SH and s.code.startswith(("60", "68"))) or (
                         market == Market.SZ and s.code.startswith(("00", "30"))
