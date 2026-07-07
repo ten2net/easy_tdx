@@ -2,6 +2,15 @@
 
 本文件记录 easy-tdx 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [1.19.5] — 2026-07-07
+
+**修复 PyPI 安装后 `localhost:8000` 返回 404** —— `pip install easy-tdx[web]` 后启动 `easy-tdx serve`，浏览器打开 `localhost:8000` 直接 404。根因：PyPI wheel 不含前端 dist（只有 Python 包），`_resolve_web_dist_dir()` 三级探测全失败返回 None，StaticFiles 不挂载。v1.19.2 的 MIME 修复、v1.19.3 的 SPA fallback 都只对 EXE 打包态生效——PyPI 安装态连 dist 都没有，更谈不上 MIME 或 SPA。
+
+### 修复
+
+- **前端 dist 打进 wheel**（`pyproject.toml` + `.github/workflows/publish.yml`）—— hatchling 配置 `force-include` 把 `web-ui/dist` 映射到包内 `easy_tdx/web/dist`；`publish.yml` 在 `python -m build` 前先 `npm ci && npm run build` 构建前端。PyPI 用户 `pip install easy-tdx[web]` 后开箱即用 UI，无需 clone 仓库或手动构建前端。
+- **`_resolve_web_dist_dir()` 第 4 级探测**（`src/easy_tdx/web/app.py`）—— 新增"包内 `easy_tdx/web/dist`"分支，在环境变量 / _MEIPASS / 仓库根三级都失败后，回退到 PyPI 安装的包内 dist。
+
 ## [1.19.4] — 2026-07-07
 
 **修复取不到行情数据的根因：MAC 客户端污染标准协议的 best_host** —— v1.19.3 在实际机器上"所有股票都取不到数据"（K 线响应偏移 2 剩余 0）。根因是 `mac/client.py` 的 `MacClient.from_best_host()` 和 `AsyncMacClient.from_best_host()` 调用了 `save_best_host(best)`——把选中的 **MAC 协议服务器**（如 `121.36.248.138`）写进了全局 `best_host` 字段，但这个字段是**标准 TDX 协议**用的。之后标准 `AsyncTdxClient` 用 `get_best_host()` 读到这个 MAC host，用标准协议请求 MAC 服务器，返回空 body。web app 启动时 lifespan 会启动 MAC 客户端，这就是污染时机。

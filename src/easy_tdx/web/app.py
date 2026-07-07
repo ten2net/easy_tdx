@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 def _resolve_web_dist_dir() -> Path | None:
     """定位前端构建产物目录（Vite build 输出的 ``web-ui/dist``）。
 
-    依次探测三处，命中即返回，全部缺失时返回 ``None``（开发期未构建前端
-    时正常，路由层照常工作，仅前端页面 404）：
+    依次探测四处，命中即返回，全部缺失时返回 ``None``（仅 API 可用，
+    前端页面 404）：
 
     1. ``EASY_TDX_WEB_DIST`` 环境变量——部署/调试时显式指定。
     2. PyInstaller 运行态：``sys._MEIPASS / "web_dist"``——单 EXE 解压
@@ -30,6 +30,9 @@ def _resolve_web_dist_dir() -> Path | None:
        此分支自动跳过。
     3. 开发态：仓库根目录的 ``web-ui/dist``——支持 ``pip install -e .``
        后直接 ``easy-tdx serve`` 调试，无需打包。
+    4. PyPI wheel 安装态：包内 ``easy_tdx/web/dist``——hatchling 把
+       编译好的 dist 作为数据文件打进 wheel（v1.19.5 起含），让
+       ``pip install easy-tdx[web]`` 后开箱即用 web UI。
     """
     env_dir = os.environ.get("EASY_TDX_WEB_DIST")
     if env_dir:
@@ -49,6 +52,11 @@ def _resolve_web_dist_dir() -> Path | None:
     p = repo_root / "web-ui" / "dist"
     if p.is_dir():
         return p
+
+    # PyPI 安装态：包内的 web/dist（wheel 打包时 force-include 进来）
+    pkg_dist = Path(__file__).resolve().parent / "dist"
+    if pkg_dist.is_dir():
+        return pkg_dist
 
     return None
 

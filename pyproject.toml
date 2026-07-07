@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "easy-tdx"
-version = "1.19.4"
+version = "1.19.5"
 description = "通达信 TCP 协议行情数据客户端，支持在线行情、离线数据读取与写入同步"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,14 @@ packaging = ["pystray>=0.19", "Pillow>=10.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/easy_tdx"]
+# 前端 dist 作为数据文件打进 wheel，让 PyPI 安装的用户也能开箱即用 web UI。
+# 前端必须先构建到 web-ui/dist/（release.yml / publish.yml 都会先 npm run build）。
+# 映射到包内 easy_tdx/web/dist/，运行时由 _resolve_web_dist_dir 第 4 级探测。
+artifacts = [
+    "src/easy_tdx/web/dist",
+]
+[tool.hatch.build.targets.wheel.force-include]
+"web-ui/dist" = "easy_tdx/web/dist"
 
 [tool.mypy]
 strict = true
