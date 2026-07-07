@@ -85,8 +85,7 @@ class GetSecurityBarsCmd(BaseCommand[list[SecurityBar]]):
                 # 成功解析的前若干条，避免一条坏数据让整页 500。
                 if bars:
                     _log.warning(
-                        "K线响应在第 %d/%d 条处被截断（%s），已丢弃末尾残缺记录，"
-                        "返回前 %d 条",
+                        "K线响应在第 %d/%d 条处被截断（%s），已丢弃末尾残缺记录，返回前 %d 条",
                         i + 1,
                         ret_count,
                         e,
@@ -154,8 +153,7 @@ class GetIndexBarsCmd(GetSecurityBarsCmd):
             except TdxDecodeError as e:
                 if bars:
                     _log.warning(
-                        "指数K线响应在第 %d/%d 条处被截断（%s），已丢弃末尾残缺记录，"
-                        "返回前 %d 条",
+                        "指数K线响应在第 %d/%d 条处被截断（%s），已丢弃末尾残缺记录，返回前 %d 条",
                         i + 1,
                         ret_count,
                         e,
