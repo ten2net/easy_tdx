@@ -10,8 +10,6 @@ from __future__ import annotations
 import pathlib
 import struct
 
-import pytest
-
 FIXTURES = pathlib.Path(__file__).parent.parent / "fixtures"
 
 

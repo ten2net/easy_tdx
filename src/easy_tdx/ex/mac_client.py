@@ -15,7 +15,12 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .._df import _to_df
-from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
+from .._reconnect import (
+    _RETRY_DELAYS,
+    AsyncHeartbeatMixin,
+    select_best_host_async,
+    select_best_host_sync,
+)
 from ..commands.base import BaseCommand
 from ..config import get_best_mac_ex_host, get_mac_ex_hosts, save_best_mac_ex_host
 from ..exceptions import TdxConnectionError
@@ -148,11 +153,12 @@ class MacExClient:
         self._conn.execute(MacExLoginCmd())
 
     def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
 
         每次重连后必须重新 ``_login()``（MAC 协议扩展行情特有）。登录握手期的
         ``TdxConnectionError`` 与业务请求一样计入退避重试；``TdxCommandError``
-        （登录被拒等确定性失败）不重试，直接抛出。
+        （登录被拒等确定性失败）不重试，直接抛出。跨主机故障转移阶段同样遵循
+        ``connect + login`` 纳入重试的语义。
         """
         try:
             return self._conn.execute(cmd)
@@ -167,6 +173,27 @@ class MacExClient:
                     self._host, self._port, self._timeout, mac_ex_mode=True
                 )
                 # connect + login 纳入重试：登录握手期连接再次断开属可重试语义。
+                try:
+                    self._conn.connect()
+                    self._login()
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            # 第二阶段：跨主机故障转移——测速切到另一台 MAC 扩展行情服务器
+            new_host = select_best_host_sync(
+                get_mac_ex_hosts(),
+                ping_ex_all,
+                save_best_mac_ex_host,
+                self._port,
+                5.0,
+                self._host,
+            )
+            if new_host is not None:
+                self._host = new_host
+                self._conn.close()
+                self._conn = ExTdxConnection(
+                    self._host, self._port, self._timeout, mac_ex_mode=True
+                )
                 try:
                     self._conn.connect()
                     self._login()
@@ -585,7 +612,7 @@ class AsyncMacExClient(AsyncHeartbeatMixin):
         await self._conn.execute(MacExLoginCmd())
 
     async def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
 
         每次重连后必须重新 ``_login()``（MAC 协议扩展行情特有）。登录握手期的
         ``TdxConnectionError`` 与业务请求一样计入退避重试；``TdxCommandError``
@@ -605,6 +632,27 @@ class AsyncMacExClient(AsyncHeartbeatMixin):
                         self._host, self._port, self._timeout, mac_ex_mode=True
                     )
                     # connect + login 纳入重试：登录握手期连接再次断开属可重试语义。
+                    try:
+                        await self._conn.connect()
+                        await self._login()
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                # 第二阶段：跨主机故障转移
+                new_host = await select_best_host_async(
+                    get_mac_ex_hosts(),
+                    ping_ex_all,
+                    save_best_mac_ex_host,
+                    self._port,
+                    5.0,
+                    self._host,
+                )
+                if new_host is not None:
+                    self._host = new_host
+                    await self._conn.close()
+                    self._conn = AsyncExTdxConnection(
+                        self._host, self._port, self._timeout, mac_ex_mode=True
+                    )
                     try:
                         await self._conn.connect()
                         await self._login()

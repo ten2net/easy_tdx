@@ -13,7 +13,12 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .._df import _apply_bar_time_align_df, _period_to_minutes, _to_df
-from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
+from .._reconnect import (
+    _RETRY_DELAYS,
+    AsyncHeartbeatMixin,
+    select_best_host_async,
+    select_best_host_sync,
+)
 from ..codec.bitmap import Fields, PresetField
 from ..commands.base import BaseCommand
 from ..config import (
@@ -224,12 +229,23 @@ class MacClient:
         try:
             self._execute(KlineOffsetCmd(0, 1))
         except TdxConnectionError:
-            self._conn.stop_heartbeat()
-            self._conn.close()
-            self._conn = TdxConnection(self._host, self._port, self._timeout)
-            self._conn.connect()
-            if self._heartbeat_interval > 0:
-                self._conn.start_heartbeat(self._heartbeat_interval)
+            self._reconnect()
+
+    def _reconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        与 TdxClient._reconnect 对称：统一收敛 ``_execute`` 同主机重试、
+        跨主机故障转移、``ensure_connected`` 的重建副本。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        self._conn.stop_heartbeat()
+        self._conn.close()
+        self._conn = TdxConnection(target, self._port, self._timeout)
+        self._conn.connect()
+        if self._heartbeat_interval > 0:
+            self._conn.start_heartbeat(self._heartbeat_interval)
 
     def __enter__(self) -> MacClient:
         self.connect()
@@ -244,11 +260,15 @@ class MacClient:
         self.close()
 
     # ------------------------------------------------------------------ #
-    # 内部执行：含自动重连
+    # 内部执行：含自动重连 + 跨主机故障转移
     # ------------------------------------------------------------------ #
 
     def _execute(self, cmd: BaseCommand[_T]) -> _T:
-        """执行命令；断线时指数退避重试。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
+
+        两阶段韧性与 TdxClient 对称：先同主机重试（``_RETRY_DELAYS``），
+        再跨主机故障转移（重新测速切到另一台 MAC 服务器）。
+        """
         try:
             return self._conn.execute(cmd)
         except TdxConnectionError:
@@ -257,11 +277,24 @@ class MacClient:
             last_exc: TdxConnectionError | None = None
             for delay in _RETRY_DELAYS:
                 time.sleep(delay)
-                self._conn.close()
-                self._conn = TdxConnection(self._host, self._port, self._timeout)
-                self._conn.connect()
-                if self._heartbeat_interval > 0:
-                    self._conn.start_heartbeat(self._heartbeat_interval)
+                self._reconnect()
+                try:
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            # 第二阶段：跨主机故障转移——测速切到另一台 MAC 服务器再试一次。
+            # save_best_mac_host（而非 save_best_host）：MAC 服务器写入独立的
+            # best_mac_host 配置项，不污染标准 best_host（v1.19.4 修复的回归）。
+            new_host = select_best_host_sync(
+                get_mac_hosts(),
+                ping_mac_all,
+                save_best_mac_host,
+                self._port,
+                5.0,
+                self._host,
+            )
+            if new_host is not None:
+                self._reconnect(new_host)
                 try:
                     return self._conn.execute(cmd)
                 except TdxConnectionError as e:
@@ -1234,11 +1267,22 @@ class AsyncMacClient(AsyncHeartbeatMixin):
         try:
             await self._execute(KlineOffsetCmd(0, 1))
         except TdxConnectionError:
-            await self._stop_heartbeat()
-            await self._conn.close()
-            self._conn = AsyncTdxConnection(self._host, self._port, self._timeout)
-            await self._conn.connect()
-            self._start_heartbeat()
+            await self._areconnect()
+
+    async def _areconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        与 AsyncTdxClient._areconnect 对称。统一收敛 ``_execute`` 同主机重试、
+        跨主机故障转移、``ensure_connected`` 的重建副本。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        await self._stop_heartbeat()
+        await self._conn.close()
+        self._conn = AsyncTdxConnection(target, self._port, self._timeout)
+        await self._conn.connect()
+        self._start_heartbeat()
 
     async def __aenter__(self) -> AsyncMacClient:
         await self.connect()
@@ -1265,7 +1309,7 @@ class AsyncMacClient(AsyncHeartbeatMixin):
     # ------------------------------------------------------------------ #
 
     async def _execute(self, cmd: BaseCommand[_T]) -> _T:
-        """执行命令；断线时指数退避重试。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。"""
         async with self._execute_lock:
             try:
                 return await self._conn.execute(cmd)
@@ -1275,9 +1319,24 @@ class AsyncMacClient(AsyncHeartbeatMixin):
                 last_exc: TdxConnectionError | None = None
                 for delay in _RETRY_DELAYS:
                     await asyncio.sleep(delay)
-                    await self._conn.close()
-                    self._conn = AsyncTdxConnection(self._host, self._port, self._timeout)
-                    await self._conn.connect()
+                    await self._areconnect()
+                    try:
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                # 第二阶段：跨主机故障转移
+                # save_best_mac_host：写入独立配置项，不污染标准 best_host
+                # （v1.19.4 修复的回归：MAC failover 不可用 save_best_host）
+                new_host = await select_best_host_async(
+                    get_mac_hosts(),
+                    ping_mac_all,
+                    save_best_mac_host,
+                    self._port,
+                    5.0,
+                    self._host,
+                )
+                if new_host is not None:
+                    await self._areconnect(new_host)
                     try:
                         return await self._conn.execute(cmd)
                     except TdxConnectionError as e:

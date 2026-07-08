@@ -9,7 +9,12 @@ from types import TracebackType
 from typing import TypeVar
 
 from .._df import _apply_bar_time_align_bars, _category_to_minutes
-from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
+from .._reconnect import (
+    _RETRY_DELAYS,
+    AsyncHeartbeatMixin,
+    select_best_host_async,
+    select_best_host_sync,
+)
 from ..commands.base import BaseCommand
 from ..config import get_best_ex_host, get_ex_hosts, save_best_ex_host
 from ..exceptions import TdxConnectionError
@@ -120,8 +125,25 @@ class ExTdxClient:
     ) -> None:
         self.close()
 
+    def _reconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        扩展行情无心跳，重建仅 close → new ExTdxConnection → connect。
+        供 ``_execute`` 同主机重试与跨主机故障转移复用。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        self._conn.close()
+        self._conn = ExTdxConnection(target, self._port, self._timeout)
+        self._conn.connect()
+
     def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
+
+        两阶段韧性与 A 股/MAC 统一（审计 #2）：先同主机重试 4 次，再跨主机
+        故障转移（测速切到另一台扩展行情服务器）。
+        """
         try:
             return self._conn.execute(cmd)
         except TdxConnectionError:
@@ -130,9 +152,22 @@ class ExTdxClient:
             last_exc: TdxConnectionError | None = None
             for delay in _RETRY_DELAYS:
                 time.sleep(delay)
-                self._conn.close()
-                self._conn = ExTdxConnection(self._host, self._port, self._timeout)
-                self._conn.connect()
+                self._reconnect()
+                try:
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            # 第二阶段：跨主机故障转移
+            new_host = select_best_host_sync(
+                get_ex_hosts(),
+                ping_ex_all,
+                save_best_ex_host,
+                self._port,
+                5.0,
+                self._host,
+            )
+            if new_host is not None:
+                self._reconnect(new_host)
                 try:
                     return self._conn.execute(cmd)
                 except TdxConnectionError as e:
@@ -350,8 +385,22 @@ class AsyncExTdxClient(AsyncHeartbeatMixin):
         """心跳使用的轻量请求（get_instrument_count，复用 _execute 重连）。"""
         return self.get_instrument_count()
 
+    async def _areconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        供 ``_execute`` 同主机重试与跨主机故障转移复用。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        await self._stop_heartbeat()
+        await self._conn.close()
+        self._conn = AsyncExTdxConnection(target, self._port, self._timeout)
+        await self._conn.connect()
+        self._start_heartbeat()
+
     async def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。"""
         async with self._execute_lock:
             try:
                 return await self._conn.execute(cmd)
@@ -361,9 +410,22 @@ class AsyncExTdxClient(AsyncHeartbeatMixin):
                 last_exc: TdxConnectionError | None = None
                 for delay in _RETRY_DELAYS:
                     await asyncio.sleep(delay)
-                    await self._conn.close()
-                    self._conn = AsyncExTdxConnection(self._host, self._port, self._timeout)
-                    await self._conn.connect()
+                    await self._areconnect()
+                    try:
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                # 第二阶段：跨主机故障转移
+                new_host = await select_best_host_async(
+                    get_ex_hosts(),
+                    ping_ex_all,
+                    save_best_ex_host,
+                    self._port,
+                    5.0,
+                    self._host,
+                )
+                if new_host is not None:
+                    await self._areconnect(new_host)
                     try:
                         return await self._conn.execute(cmd)
                     except TdxConnectionError as e:
