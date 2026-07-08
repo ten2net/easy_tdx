@@ -3,6 +3,7 @@
 from .block import (
     CustomerBlock,
     read_block_dat,
+    read_customer_block_codes,
     read_customer_blocks,
     write_customer_block,
 )
@@ -76,6 +77,7 @@ __all__ = [
     # 板块
     "CustomerBlock",
     "read_block_dat",
+    "read_customer_block_codes",
     "read_customer_blocks",
     "write_customer_block",
     # 股本变迁

@@ -159,3 +159,28 @@ def test_write_customer_block_missing_dir(tmp_path: Path) -> None:
     """目录不存在时抛出 TdxOfflineError。"""
     with pytest.raises(TdxOfflineError, match="自定义板块目录不存在"):
         write_customer_block(tmp_path / "not_exist", "test", [("SH", "600000")])
+
+
+def test_read_customer_block_codes(tmp_path: Path) -> None:
+    """按名称读取单个板块的代码列表。"""
+    from easy_tdx.offline import read_customer_block_codes
+
+    block_dir = _make_blocknew_dir(tmp_path)
+    write_customer_block(
+        block_dir,
+        "test_block",
+        [("SH", "600000"), ("SZ", "000001")],
+        backup=False,
+    )
+
+    codes = read_customer_block_codes(block_dir, "test_block")
+    assert set(codes) == {("SH", "600000"), ("SZ", "000001")}
+
+
+def test_read_customer_block_codes_missing(tmp_path: Path) -> None:
+    """板块不存在时抛出 TdxOfflineError。"""
+    from easy_tdx.offline import read_customer_block_codes
+
+    block_dir = _make_blocknew_dir(tmp_path)
+    with pytest.raises(TdxOfflineError, match="未找到板块"):
+        read_customer_block_codes(block_dir, "不存在")

@@ -19,6 +19,9 @@ _DEFAULT_MARKER_MAP: dict[str, str] = {
     "BJ": "2",  # 部分新版本通达信对北交所使用 2
 }
 
+# .blk 首位字符 → 市场字符串
+_MARKER_TO_MARKET: dict[str, str] = {v: k for k, v in _DEFAULT_MARKER_MAP.items()}
+
 # 危险字符：防止路径穿越或破坏 cfg/blk 格式
 _UNSAFE_BLOCK_NAME = re.compile(r"[\\/:*?\"<>|\.\x00-\x1f]")
 
@@ -118,6 +121,54 @@ def _market_to_marker(market: str, marker_map: dict[str, str] | None) -> str:
     if key not in mapping:
         raise ValueError(f"不支持的市场 '{market}'，可用: {list(mapping.keys())}")
     return mapping[key]
+
+
+def read_customer_block_codes(
+    block_dir: str | Path,
+    block_name: str,
+) -> list[tuple[str, str]]:
+    """按名称读取单个自定义板块内的股票代码列表。
+
+    Args:
+        block_dir: 自定义板块目录路径。
+        block_name: 板块显示名称（如 "强势股"）。
+
+    Returns:
+        (market, code) 元组列表，market 为大写的 SZ/SH。
+
+    Raises:
+        TdxOfflineError: 目录或板块不存在。
+    """
+    block_dir = Path(block_dir)
+    if not block_dir.is_dir():
+        raise TdxOfflineError(f"自定义板块目录不存在: {block_dir}")
+
+    entries = _read_cfg_entries(block_dir)
+    target_filename: str | None = None
+    for name, filename in entries:
+        if name == block_name:
+            target_filename = filename
+            break
+
+    if not target_filename:
+        raise TdxOfflineError(f"未找到板块 '{block_name}'，请先在通达信中创建该板块")
+
+    blk_path = block_dir / f"{target_filename}.blk"
+    if not blk_path.is_file():
+        raise TdxOfflineError(f"板块文件不存在: {blk_path}")
+
+    codes: list[tuple[str, str]] = []
+    for line in blk_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or len(line) < 2:
+            continue
+        marker = line[0]
+        code = line[1:]
+        market = _MARKER_TO_MARKET.get(marker)
+        if market is None:
+            continue
+        codes.append((market, code))
+    return codes
 
 
 def read_customer_blocks(block_dir: str | Path) -> list[CustomerBlock]:

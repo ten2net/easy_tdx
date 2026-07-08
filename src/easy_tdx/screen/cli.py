@@ -47,6 +47,25 @@ def screen() -> None:
     help="并发工作进程数: 0=串行（默认），2+=ProcessPoolExecutor 并发（推荐 4-8）",
 )
 @click.option("--cache", "cache_file", default=None, help="增量扫描缓存文件路径（JSON）")
+@click.option(
+    "--to-block",
+    "to_block",
+    default=None,
+    help="同时写入通达信自定义板块名称，需配合 --block-dir",
+)
+@click.option(
+    "--block-dir",
+    "block_dir",
+    default=None,
+    help="通达信自定义板块目录路径（如 C:\\new_jyplug\\T0002\\blocknew）",
+)
+@click.option(
+    "--block-mode",
+    "block_mode",
+    type=click.Choice(["overwrite", "append"]),
+    default="overwrite",
+    help="写入板块方式: overwrite(覆盖,默认) / append(追加)",
+)
 def scan(
     strategy_file: str,
     output_file: str | None,
@@ -56,6 +75,9 @@ def scan(
     commission: float,
     workers: int,
     cache_file: str | None,
+    to_block: str | None,
+    block_dir: str | None,
+    block_mode: str,
 ) -> None:
     """纯离线扫描全市场，找出触发买入信号的股票。
 
@@ -121,6 +143,17 @@ def scan(
         click.echo(f"信号数: {len(results)} → {output_file}")
     else:
         click.echo(json_str)
+
+    # 写入通达信自定义板块
+    if to_block:
+        if not block_dir:
+            click.echo("错误: --to-block 必须配合 --block-dir 使用", err=True)
+            raise SystemExit(1)
+        try:
+            _write_to_block(results, to_block, block_dir, block_mode)
+        except Exception as e:
+            click.echo(f"写入板块失败: {e}", err=True)
+            raise SystemExit(1)
 
 
 # ── rank 子命令 ──────────────────────────────────────────────────────────────
@@ -370,22 +403,319 @@ def strength_cmd(
             click.echo("错误: --to-block 必须配合 --block-dir 使用", err=True)
             raise SystemExit(1)
         try:
-            from ..offline import write_customer_block
-
-            filename, count = write_customer_block(
-                block_dir=block_dir,
-                block_name=to_block,
-                codes=[(r.market, r.code) for r in results],
-                mode=block_mode,
-            )
-            click.echo(
-                f"已{('追加' if block_mode == 'append' else '覆盖')}写入板块 "
-                f"[{to_block}] ({filename}.blk): {count} 只",
-                err=True,
-            )
+            _write_to_block(results, to_block, block_dir, block_mode)
         except Exception as e:
             click.echo(f"写入板块失败: {e}", err=True)
             raise SystemExit(1)
+
+
+# ── intraday 子命令 ──────────────────────────────────────────────────────────
+
+
+@screen.command("intraday")
+@click.option(
+    "--period",
+    default="5MIN",
+    type=click.Choice(["1MIN", "5MIN"]),
+    help="分钟线周期: 1MIN / 5MIN（默认 5MIN）",
+)
+@click.option(
+    "--lookback",
+    default=6,
+    type=int,
+    help="统计最近 N 根 K 线的异动（默认 6，即 5MIN 为最近 30 分钟）",
+)
+@click.option(
+    "--min-pct",
+    default=2.0,
+    type=float,
+    help="最近 N 根 K 线累计最小涨幅（%%，默认 2.0，0=不过滤）",
+)
+@click.option(
+    "--volume-ratio",
+    default=1.5,
+    type=float,
+    help="最近 N 根均量相对前 N 根均量的最小倍数（默认 1.5，0=不过滤）",
+)
+@click.option(
+    "--breakout-lookback",
+    default=0,
+    type=int,
+    help="突破近期高低点的观察窗口（0=不判断突破，默认 0）",
+)
+@click.option("--top", "top_n", default=50, type=int, help="返回前 N 名（默认 50）")
+@click.option("--universe", default="all", help="范围: all/sh/sz/<文件路径>")
+@click.option("--vipdoc", default=None, help="离线数据目录（默认自动检测）")
+@click.option("--output", "output_file", default=None, help="输出 JSON 文件（默认 stdout）")
+@click.option("--table", "use_table", is_flag=True, help="表格输出")
+@click.option(
+    "--to-block",
+    "to_block",
+    default=None,
+    help="同时写入通达信自定义板块名称，需配合 --block-dir",
+)
+@click.option(
+    "--block-dir",
+    "block_dir",
+    default=None,
+    help="通达信自定义板块目录路径（如 C:\\new_jyplug\\T0002\\blocknew）",
+)
+@click.option(
+    "--block-mode",
+    "block_mode",
+    type=click.Choice(["overwrite", "append"]),
+    default="overwrite",
+    help="写入板块方式: overwrite(覆盖,默认) / append(追加)",
+)
+def intraday_cmd(
+    period: str,
+    lookback: int,
+    min_pct: float,
+    volume_ratio: float,
+    breakout_lookback: int,
+    top_n: int,
+    universe: str,
+    vipdoc: str | None,
+    output_file: str | None,
+    use_table: bool,
+    to_block: str | None,
+    block_dir: str | None,
+    block_mode: str,
+) -> None:
+    """从本地分钟线文件扫描异动个股。
+
+    基于用户自定义规则（N 根 K 线涨幅 + 量比 + 突破）发现盘中异动。
+
+    示例：
+
+      easy-tdx screen intraday --period 5MIN --lookback 6 --min-pct 2.0 --table
+
+      easy-tdx screen intraday --period 5MIN --lookback 3 --volume-ratio 2.0 --top 20
+
+      easy-tdx screen intraday --period 5MIN --breakout-lookback 24 --top 30 --table \
+        --to-block 异动 --block-dir "C:\\new_jyplug\\T0002\\blocknew"
+    """
+    from .intraday import IntradayScanner
+
+    click.echo(f"周期: {period} | 范围: {universe} | Top: {top_n}", err=True)
+    click.echo(
+        f"规则: 最近 {lookback} 根涨幅≥{min_pct}% 且 量比≥{volume_ratio}",
+        err=True,
+    )
+
+    scanner = IntradayScanner(
+        vipdoc_path=vipdoc,
+        period=period,
+        lookback=lookback,
+        min_pct=min_pct,
+        volume_ratio=volume_ratio,
+        breakout_lookback=breakout_lookback,
+    )
+
+    def on_progress(current: int, total: int, name: str) -> None:
+        if name == "done":
+            click.echo(f"\r扫描完成: {total} 只", err=True)
+        else:
+            pct = current * 100 // total if total > 0 else 0
+            click.echo(f"\r[{current}/{total}] {pct}% {name}", nl=False, err=True)
+
+    results = scanner.scan(
+        universe=universe,
+        top_n=top_n,
+        progress_callback=on_progress,
+    )
+
+    if use_table:
+        click.echo(scanner.to_table(results, period))
+    else:
+        json_str = scanner.to_json(results, period)
+        if output_file:
+            Path(output_file).write_text(json_str, encoding="utf-8")
+            click.echo(f"异动: {len(results)} 只 → {output_file}")
+        else:
+            click.echo(json_str)
+
+    # 写入通达信自定义板块
+    if to_block:
+        if not block_dir:
+            click.echo("错误: --to-block 必须配合 --block-dir 使用", err=True)
+            raise SystemExit(1)
+        try:
+            _write_to_block(results, to_block, block_dir, block_mode)
+        except Exception as e:
+            click.echo(f"写入板块失败: {e}", err=True)
+            raise SystemExit(1)
+
+
+# ── monitor 子命令 ───────────────────────────────────────────────────────────
+
+
+@screen.command("monitor")
+@click.option(
+    "--block-dir",
+    "block_dir",
+    required=True,
+    help="通达信自定义板块目录路径（如 C:\\new_jyplug\\T0002\\blocknew）",
+)
+@click.option(
+    "--from-block",
+    "from_block",
+    required=True,
+    help="源板块名称（如 '强势股'），从此板块读取监控股票池",
+)
+@click.option(
+    "--period",
+    default="5MIN",
+    type=click.Choice(["1MIN", "5MIN"]),
+    help="K线周期: 1MIN / 5MIN（默认 5MIN）",
+)
+@click.option(
+    "--lookback",
+    default=3,
+    type=int,
+    help="统计最近 N 根 K 线的异动（默认 3）",
+)
+@click.option(
+    "--min-pct",
+    default=1.5,
+    type=float,
+    help="最近 N 根 K 线累计最小涨幅（%%，默认 1.5，0=不过滤）",
+)
+@click.option(
+    "--volume-ratio",
+    default=1.5,
+    type=float,
+    help="最近 N 根均量相对前 N 根均量的最小倍数（默认 1.5，0=不过滤）",
+)
+@click.option(
+    "--workers",
+    default=4,
+    type=int,
+    help="并发线程数（默认 4，0=串行）",
+)
+@click.option("--top", "top_n", default=50, type=int, help="返回前 N 名（默认 50）")
+@click.option("--output", "output_file", default=None, help="输出 JSON 文件（默认 stdout）")
+@click.option("--table", "use_table", is_flag=True, help="表格输出")
+@click.option(
+    "--to-block",
+    "to_block",
+    default=None,
+    help="把结果写入通达信自定义板块名称，需配合 --block-dir",
+)
+@click.option(
+    "--block-mode",
+    "block_mode",
+    type=click.Choice(["overwrite", "append"]),
+    default="overwrite",
+    help="写入板块方式: overwrite(覆盖,默认) / append(追加)",
+)
+def monitor_cmd(
+    block_dir: str,
+    from_block: str,
+    period: str,
+    lookback: int,
+    min_pct: float,
+    volume_ratio: float,
+    workers: int,
+    top_n: int,
+    output_file: str | None,
+    use_table: bool,
+    to_block: str | None,
+    block_mode: str,
+) -> None:
+    """从通达信板块读取股票池，在线拉取分钟 K 线监控异动。
+
+    不依赖本地分钟线文件，直接通过行情服务器获取最新 1/5 分钟数据。
+
+    示例：
+
+      easy-tdx screen monitor --block-dir "C:\\new_jyplug\\T0002\\blocknew" \
+        --from-block 强势股 --period 5MIN --lookback 3 --table
+
+      easy-tdx screen monitor --block-dir "C:\\new_jyplug\\T0002\\blocknew" \
+        --from-block 强势股 --to-block 异动 --top 20
+    """
+    from ..offline import read_customer_block_codes
+    from .monitor import IntradayMonitor
+
+    click.echo(f"源板块: {from_block} | 周期: {period} | Top: {top_n}", err=True)
+
+    try:
+        codes = read_customer_block_codes(block_dir, from_block)
+    except Exception as e:
+        click.echo(f"读取板块失败: {e}", err=True)
+        raise SystemExit(1)
+
+    if not codes:
+        click.echo("源板块为空，无需监控")
+        return
+
+    click.echo(f"股票池: {len(codes)} 只", err=True)
+    click.echo(
+        f"规则: 最近 {lookback} 根涨幅≥{min_pct}% 且 量比≥{volume_ratio}",
+        err=True,
+    )
+
+    monitor = IntradayMonitor(
+        period=period,
+        lookback=lookback,
+        min_pct=min_pct,
+        volume_ratio=volume_ratio,
+    )
+
+    def on_progress(current: int, total: int, label: str) -> None:
+        if label == "done":
+            click.echo(f"\r监控完成: {total} 只", err=True)
+        else:
+            pct = current * 100 // total if total > 0 else 0
+            click.echo(f"\r[{current}/{total}] {pct}% {label}", nl=False, err=True)
+
+    results = monitor.scan(
+        codes=codes,
+        top_n=top_n,
+        workers=workers,
+        progress_callback=on_progress,
+    )
+
+    if use_table:
+        click.echo(monitor.to_table(results, period))
+    else:
+        json_str = monitor.to_json(results, period)
+        if output_file:
+            Path(output_file).write_text(json_str, encoding="utf-8")
+            click.echo(f"异动: {len(results)} 只 → {output_file}")
+        else:
+            click.echo(json_str)
+
+    # 写入通达信自定义板块
+    if to_block:
+        try:
+            _write_to_block(results, to_block, block_dir, block_mode)
+        except Exception as e:
+            click.echo(f"写入板块失败: {e}", err=True)
+            raise SystemExit(1)
+
+
+def _write_to_block(
+    results: list[Any],
+    to_block: str,
+    block_dir: str,
+    block_mode: str,
+) -> None:
+    """把选股结果写入通达信自定义板块（results 需有 market/code 属性）。"""
+    from ..offline import write_customer_block
+
+    filename, count = write_customer_block(
+        block_dir=block_dir,
+        block_name=to_block,
+        codes=[(r.market, r.code) for r in results],
+        mode=block_mode,
+    )
+    click.echo(
+        f"已{('追加' if block_mode == 'append' else '覆盖')}写入板块 "
+        f"[{to_block}] ({filename}.blk): {count} 只",
+        err=True,
+    )
 
 
 def _enrich_strength_names(
