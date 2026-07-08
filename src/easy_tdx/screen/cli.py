@@ -258,6 +258,25 @@ def rank_cmd(
 @click.option("--output", "output_file", default=None, help="输出 JSON 文件（默认 stdout）")
 @click.option("--table", "use_table", is_flag=True, help="表格输出")
 @click.option("--names/--no-names", default=False, help="在线查询股票名称（默认关闭）")
+@click.option(
+    "--to-block",
+    "to_block",
+    default=None,
+    help="同时写入通达信自定义板块名称（如 '强势股'），需配合 --block-dir",
+)
+@click.option(
+    "--block-dir",
+    "block_dir",
+    default=None,
+    help="通达信自定义板块目录路径（如 C:\\new_jyplug\\T0002\\blocknew）",
+)
+@click.option(
+    "--block-mode",
+    "block_mode",
+    type=click.Choice(["overwrite", "append"]),
+    default="overwrite",
+    help="写入板块方式: overwrite(覆盖,默认) / append(追加)",
+)
 def strength_cmd(
     preset: str,
     w5: float | None,
@@ -273,6 +292,9 @@ def strength_cmd(
     output_file: str | None,
     use_table: bool,
     names: bool,
+    to_block: str | None,
+    block_dir: str | None,
+    block_mode: str,
 ) -> None:
     """全市场强势股排名 — 按 5/20/60 日涨幅加权排序。
 
@@ -341,6 +363,29 @@ def strength_cmd(
             click.echo(f"排名: {len(results)} 只 → {output_file}")
         else:
             click.echo(json_str)
+
+    # 写入通达信自定义板块
+    if to_block:
+        if not block_dir:
+            click.echo("错误: --to-block 必须配合 --block-dir 使用", err=True)
+            raise SystemExit(1)
+        try:
+            from ..offline import write_customer_block
+
+            filename, count = write_customer_block(
+                block_dir=block_dir,
+                block_name=to_block,
+                codes=[(r.market, r.code) for r in results],
+                mode=block_mode,
+            )
+            click.echo(
+                f"已{('追加' if block_mode == 'append' else '覆盖')}写入板块 "
+                f"[{to_block}] ({filename}.blk): {count} 只",
+                err=True,
+            )
+        except Exception as e:
+            click.echo(f"写入板块失败: {e}", err=True)
+            raise SystemExit(1)
 
 
 def _enrich_strength_names(

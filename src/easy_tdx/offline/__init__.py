@@ -1,6 +1,11 @@
 """离线数据读写模块 —— 从本地通达信安装目录读取/写入数据文件。"""
 
-from .block import CustomerBlock, read_block_dat, read_customer_blocks
+from .block import (
+    CustomerBlock,
+    read_block_dat,
+    read_customer_blocks,
+    write_customer_block,
+)
 from .daily_bar import find_daily_bar_file, read_daily_bars
 from .ex_daily_bar import ExDailyBar, read_ex_daily_bars
 from .finders import find_5min_bar_file, find_lc1_bar_file, find_lc5_bar_file
@@ -72,6 +77,7 @@ __all__ = [
     "CustomerBlock",
     "read_block_dat",
     "read_customer_blocks",
+    "write_customer_block",
     # 股本变迁
     "GbbqRecord",
     "read_gbbq",
