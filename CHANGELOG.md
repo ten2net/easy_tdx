@@ -2,6 +2,20 @@
 
 本文件记录 easy-tdx 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [1.20.0] — 2026-07-08
+
+**服务器失败时自动 ping 切换，无需手动 `easy-tdx ping`** —— 解决普通用户最困惑的痛点：连不上服务器或返回空数据时，之前必须手动跑 `easy-tdx ping` 才能恢复，普通人根本不知道该这么做。现在 Python API / CLI / Web API **三入口全部自动**——服务器连不上或返回空统计指数时，自动测速、切到延迟最低的可用服务器、重试，全程对用户透明。收敛在 `_reconnect.py` 单点注入 8 个 client 的 `_execute`，零冗余、不新增配置开关。
+
+### 新增
+
+- **跨主机故障转移（连接失败）**（`src/easy_tdx/_reconnect.py`）—— 8 个 client（TdxClient / MacClient / ExTdxClient / MacExClient，各 sync+async）的 `_execute` 在同主机重试耗尽（`_RETRY_DELAYS` 4 次指数退避）后，自动调 `select_best_host_sync/async` 重新测速、切到延迟最低的**另一台**服务器再试一轮。复用 `auto_reconnect` 开关（`False` 时不触发），内置 30s 节流防惊群。
+- **空数据故障转移（`get_market_stat`）**（`src/easy_tdx/_reconnect.py` + `client.py`）—— 880005/880001/880006 统计指数并非所有服务器都提供，返回空 quotes 时触发 `find_working_host_sync/async`：按延迟顺序逐台实测（最多 5 台），找到第一台返回有效数据的服务器。这是 v1.20.0 的核心场景——延迟最低的服务器不一定服务统计指数，必须逐台实测。
+- **统一重建 helper**（`client.py` / `mac/client.py` / `ex/client.py` / `ex/mac_client.py`）—— 新增 `_reconnect`/`_areconnect` 收敛各 client 内"重建连接 + 起心跳"的副本（原 `_execute` / `ensure_connected` 各有一份），消除 4 处重复，保证 failover 与重试逻辑一致。
+
+### 修复
+
+- **MacClient failover 不污染标准 best_host**（`src/easy_tdx/mac/client.py`）—— MAC 客户端的 failover 用 `save_best_mac_host`（写入独立配置项），而非 `save_best_host`。延续 v1.19.4 的修复（MAC 服务器不再写进标准 best_host），含防回归测试锁定。
+
 ## [1.19.7] — 2026-07-07
 
 **新增「服务器设置」页面：web UI 上测速 + 切换通达信服务器** —— 解决"有些用户获取到的 IP 能连通、有些不能"的问题。不同地区/运营商对通达信各服务器连通性不同，之前用户只能碰运气或手动改 config.json。现在在 web UI 上新增第六个页面「服务器设置」，列出全部 50+ 候选服务器、一键并发测速、点选切换——切换后立即生效（热重连），无需重启服务。
