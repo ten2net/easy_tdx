@@ -9,15 +9,21 @@ import {
   formatError,
   runBacktest,
   submitPortfolioTask,
+  submitOptimizeAllTask,
   submitOptimizeTask,
+  submitMultiStrategyTask,
   fetchTask,
 } from '../api'
 import type {
   BacktestRequest,
   BacktestResult,
   Bar,
+  Category,
+  MultiStrategyBacktestRequest,
   PortfolioBacktestRequest,
   PortfolioResult,
+  OptimizeAllBacktestRequest,
+  OptimizeAllResult,
   OptimizeBacktestRequest,
   OptimizeResult,
   StrategySchema,
@@ -114,9 +120,63 @@ export const useBacktestStore = defineStore('backtest', () => {
     error.value = ''
   }
 
+  // ── 多策略组合回测（资金分仓） ─────────────────────────────────────────
+  const multiStrategyResult = ref<PortfolioResult | null>(null)
+  const multiStrategyRunning = ref(false)
+
+  /** 提交多策略组合回测后台任务并轮询直到完成。
+   * 结果结构同 PortfolioResult（复用组合页图表组件）。 */
+  async function runMultiStrategy(req: MultiStrategyBacktestRequest) {
+    multiStrategyRunning.value = true
+    error.value = ''
+    multiStrategyResult.value = null
+    try {
+      const { task_id } = await submitMultiStrategyTask(req)
+      const start = Date.now()
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const state = await fetchTask(task_id)
+        if (state.status === 'done' && state.result) {
+          multiStrategyResult.value = state.result as PortfolioResult
+          break
+        }
+        if (state.status === 'failed') {
+          throw new Error(state.error || '多策略组合回测失败')
+        }
+        if (Date.now() - start > 180_000) throw new Error('多策略组合回测超时（180s）')
+        await new Promise((r) => setTimeout(r, 400))
+      }
+    } catch (e) {
+      error.value = formatError(e)
+      multiStrategyResult.value = null
+    } finally {
+      multiStrategyRunning.value = false
+    }
+  }
+
+  function clearMultiStrategy() {
+    multiStrategyResult.value = null
+    error.value = ''
+  }
+
   // ── 参数网格寻优（Phase 4） ─────────────────────────────────────────────
   const optimizeResult = ref<OptimizeResult | null>(null)
   const optimizeRunning = ref(false)
+
+  /** 寻优实际使用的标的上下文（取行情成功那一刻冻结）。
+   * 放在 store 而非组件里，是为了在用户切走再回 /optimize 时，「查看」按钮仍能拼出正确 URL
+   * —— 组件 ref 在卸载后丢失，而 store 与 optimizeResult 同生命周期保留。
+   * 由 OptimizeView 在 loadBars() 成功后通过 setOptimizeContext() 写入。 */
+  const optimizeContext = ref<{
+    code: string
+    category: Category
+    startDate: string
+    endDate: string
+  } | null>(null)
+
+  function setOptimizeContext(ctx: { code: string; category: Category; startDate: string; endDate: string }) {
+    optimizeContext.value = ctx
+  }
 
   /** 提交寻优后台任务并轮询直到完成。 */
   async function runOptimize(req: OptimizeBacktestRequest) {
@@ -147,6 +207,40 @@ export const useBacktestStore = defineStore('backtest', () => {
     }
   }
 
+  // ── 一键寻优所有策略（Phase 6） ─────────────────────────────────────────
+  const optimizeAllResult = ref<OptimizeAllResult | null>(null)
+  const optimizeAllRunning = ref(false)
+
+  /** 提交「一键寻优所有策略」后台任务并轮询直到完成。 */
+  async function runOptimizeAll(req: OptimizeAllBacktestRequest) {
+    optimizeAllRunning.value = true
+    error.value = ''
+    optimizeAllResult.value = null
+    try {
+      const { task_id } = await submitOptimizeAllTask(req)
+      const start = Date.now()
+      // 一键寻优全策略网格点更多，放宽超时到 300s
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const state = await fetchTask(task_id)
+        if (state.status === 'done' && state.result) {
+          optimizeAllResult.value = state.result as OptimizeAllResult
+          break
+        }
+        if (state.status === 'failed') {
+          throw new Error(state.error || '一键寻优失败')
+        }
+        if (Date.now() - start > 300_000) throw new Error('一键寻优超时（300s）')
+        await new Promise((r) => setTimeout(r, 500))
+      }
+    } catch (e) {
+      error.value = formatError(e)
+      optimizeAllResult.value = null
+    } finally {
+      optimizeAllRunning.value = false
+    }
+  }
+
   return {
     // state
     strategies,
@@ -158,8 +252,13 @@ export const useBacktestStore = defineStore('backtest', () => {
     error,
     portfolioResult,
     portfolioRunning,
+    multiStrategyResult,
+    multiStrategyRunning,
     optimizeResult,
     optimizeRunning,
+    optimizeContext,
+    optimizeAllResult,
+    optimizeAllRunning,
     // getters
     hasBars,
     // actions
@@ -169,6 +268,10 @@ export const useBacktestStore = defineStore('backtest', () => {
     clearResult,
     runPortfolio,
     clearPortfolio,
+    runMultiStrategy,
+    clearMultiStrategy,
     runOptimize,
+    runOptimizeAll,
+    setOptimizeContext,
   }
 })

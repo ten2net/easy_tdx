@@ -7,10 +7,18 @@ import type {
   BacktestResult,
   Bar,
   Category,
+  MultiStrategyBacktestRequest,
+  OptimizeAllBacktestRequest,
   OptimizeBacktestRequest,
   PortfolioBacktestRequest,
-  TaskListResponse,
+  SavedStrategy,
+  SavedStrategyCreate,
+  SavedStrategyListResponse,
+  ServerHostInfo,
+  ServerHostListResponse,
+  ServerSwitchResult,
   StrategiesResponse,
+  TaskListResponse,
   TaskState,
   TaskSubmitResponse,
 } from './types'
@@ -147,11 +155,37 @@ export async function submitPortfolioTask(
   return (await resp.json()) as TaskSubmitResponse
 }
 
+/** 提交多策略组合回测后台任务（资金分仓），返回 task_id。 */
+export async function submitMultiStrategyTask(
+  req: MultiStrategyBacktestRequest,
+): Promise<TaskSubmitResponse> {
+  const resp = await fetch(`${BASE}/backtest/multi-strategy/run/async`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as TaskSubmitResponse
+}
+
 /** 提交参数网格寻优后台任务，返回 task_id。 */
 export async function submitOptimizeTask(
   req: OptimizeBacktestRequest,
 ): Promise<TaskSubmitResponse> {
   const resp = await fetch(`${BASE}/backtest/optimize/run/async`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as TaskSubmitResponse
+}
+
+/** 提交「一键寻优所有策略」后台任务，返回 task_id。 */
+export async function submitOptimizeAllTask(
+  req: OptimizeAllBacktestRequest,
+): Promise<TaskSubmitResponse> {
+  const resp = await fetch(`${BASE}/backtest/optimize-all/run/async`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),
@@ -199,4 +233,68 @@ export async function runBacktestWithPolling(
     }
     await new Promise((r) => setTimeout(r, intervalMs))
   }
+}
+
+// ── 策略库（已保存策略）──────────────────────────────────────────────────────
+
+/** 列出全部已保存策略（按创建时间倒序）。 */
+export async function fetchSavedStrategies(): Promise<SavedStrategyListResponse> {
+  const resp = await fetch(`${BASE}/strategies`)
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as SavedStrategyListResponse
+}
+
+/** 查看单条已保存策略。 */
+export async function fetchSavedStrategy(id: string): Promise<SavedStrategy> {
+  const resp = await fetch(`${BASE}/strategies/${id}`)
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as SavedStrategy
+}
+
+/** 保存一条策略（含当时的标的上下文与成绩快照）。 */
+export async function saveStrategy(req: SavedStrategyCreate): Promise<SavedStrategy> {
+  const resp = await fetch(`${BASE}/strategies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as SavedStrategy
+}
+
+/** 删除一条已保存策略。 */
+export async function deleteSavedStrategy(id: string): Promise<void> {
+  const resp = await fetch(`${BASE}/strategies/${id}`, { method: 'DELETE' })
+  if (!resp.ok) await throwError(resp)
+}
+
+// ── 服务器设置 ──────────────────────────────────────────────────────────────
+
+/** 列出所有候选通达信服务器 + 当前使用的 host（不含延迟，需点测速）。 */
+export async function fetchServerHosts(): Promise<ServerHostListResponse> {
+  const resp = await fetch(`${BASE}/server/hosts`)
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as ServerHostListResponse
+}
+
+/** 并发测速全部（或指定）host，返回延迟和可达性。 */
+export async function testServerHosts(hosts?: string[]): Promise<ServerHostInfo[]> {
+  const resp = await fetch(`${BASE}/server/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hosts: hosts ?? null }),
+  })
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as ServerHostInfo[]
+}
+
+/** 切换到指定 host（热重连，无需重启服务）。 */
+export async function switchServerHost(host: string): Promise<ServerSwitchResult> {
+  const resp = await fetch(`${BASE}/server/switch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ host }),
+  })
+  if (!resp.ok) await throwError(resp)
+  return (await resp.json()) as ServerSwitchResult
 }

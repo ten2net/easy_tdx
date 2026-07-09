@@ -11,6 +11,8 @@
         <RouterLink to="/portfolio" active-class="active">组合回测</RouterLink>
         <RouterLink to="/optimize" active-class="active">参数寻优</RouterLink>
         <RouterLink to="/compare" active-class="active">结果对比</RouterLink>
+        <RouterLink to="/strategies" active-class="active">策略库</RouterLink>
+        <RouterLink to="/settings" active-class="active">服务器设置</RouterLink>
       </nav>
     </header>
     <main class="app-main">

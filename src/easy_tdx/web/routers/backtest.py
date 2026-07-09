@@ -19,6 +19,10 @@ from fastapi import APIRouter, Depends
 from easy_tdx.web.backtest_schemas import (
     BacktestRequest,
     BacktestResultResponse,
+    MultiStrategyBacktestRequest,
+    OptimizeAllBacktestRequest,
+    OptimizeAllRankEntry,
+    OptimizeAllResult,
     OptimizeBacktestRequest,
     PortfolioBacktestRequest,
     StrategySchemaResponse,
@@ -179,7 +183,37 @@ async def run_portfolio_backtest_async(
     return TaskSubmitResponse(task_id=task_id, status=status)
 
 
-# ── 参数网格寻优 ─────────────────────────────────────────────────────────────
+# ── 多策略组合回测（资金分仓） ───────────────────────────────────────────────
+
+
+@router.post(
+    "/backtest/multi-strategy/run/async", response_model=TaskSubmitResponse, status_code=202
+)
+async def run_multi_strategy_backtest_async(
+    req: MultiStrategyBacktestRequest,
+    client: Any = Depends(get_client),
+) -> TaskSubmitResponse:
+    """提交多策略组合回测后台任务（资金分仓 / 并行制）。
+
+    勾选 N 个策略，各自在原标的（取最新行情）上独立回测，各拿总资金 1/N。
+    单个策略取数失败则跳过（不中断整组），全部失败返回 400。结果为
+    MultiStrategyResult（结构同 PortfolioResult），通过 GET /backtest/tasks/{task_id} 轮询。
+    """
+    slots = await _fetch_multi_strategy_bars(client, req.items)
+    if not slots:
+        raise ValueError("所有策略槽位均未取到有效行情数据")
+
+    snapshot = req.model_copy()
+    description = f"多策略组合 | {len(slots)}个策略"
+
+    runner = get_runner()
+    task_id = runner.submit(
+        lambda: _run_multi_strategy_backtest(slots, snapshot),
+        description=description,
+    )
+    state = runner.get(task_id)
+    status: Any = state.status if state.status in ("pending", "running") else "running"
+    return TaskSubmitResponse(task_id=task_id, status=status)
 
 
 @router.post("/backtest/optimize/run/async", response_model=TaskSubmitResponse, status_code=202)
@@ -215,6 +249,47 @@ async def run_optimize_async(
     runner = get_runner()
     task_id = runner.submit(
         lambda: _run_optimize(df, snapshot),
+        description=description,
+    )
+    state = runner.get(task_id)
+    status: Any = state.status if state.status in ("pending", "running") else "running"
+    return TaskSubmitResponse(task_id=task_id, status=status)
+
+
+# ── 一键寻优所有策略 ───────────────────────────────────────────────────────────
+
+
+@router.post("/backtest/optimize-all/run/async", response_model=TaskSubmitResponse, status_code=202)
+async def run_optimize_all_async(
+    req: OptimizeAllBacktestRequest,
+    client: Any = Depends(get_client),
+) -> TaskSubmitResponse:
+    """提交「一键寻优所有策略」后台任务。
+
+    在单个标的上，对所有策略的预设参数网格（见 presets.STRATEGY_PRESETS）依次
+    做网格寻优，取各策略最优点汇总成全局排名。数据获取支持内联 ohlcv 或按
+    symbol 取行情。通过 GET /backtest/tasks/{task_id} 轮询结果。
+    """
+    # 1. 取数据
+    if req.ohlcv is not None:
+        df = _ohlcv_to_df(req.ohlcv)
+        desc_bars = f"{len(df)} 根"
+    elif req.symbol is not None:
+        df = await _fetch_bars(client, req.symbol, req.category, 800)
+        desc_bars = f"{req.symbol}"
+        if req.start_date or req.end_date:
+            df = _filter_df_by_date(df, req.start_date, req.end_date)
+    else:
+        raise ValueError("必须提供 ohlcv 或 symbol")
+
+    # 2. 捕获快照
+    snapshot = req.model_copy()
+    description = f"一键寻优全部策略 | {desc_bars}"
+
+    # 3. 提交后台任务
+    runner = get_runner()
+    task_id = runner.submit(
+        lambda: _run_optimize_all(df, snapshot),
         description=description,
     )
     state = runner.get(task_id)
@@ -382,6 +457,93 @@ async def _fetch_portfolio_bars(
     return stock_data_list
 
 
+async def _fetch_multi_strategy_bars(
+    client: Any,
+    items: list[Any],
+) -> list[Any]:
+    """逐个策略槽位取行情 + 构造策略实例，组装 StrategySlot 列表（async）。
+
+    每条 item 自带 symbol（如 "SH:601088"）、category、start/end_date、strategy+params。
+    单条取数或策略构造失败则跳过（不中断整组）。返回的 StrategySlot 已绑定好策略
+    实例与 df，可直接交给后台线程跑引擎（避免把 async client 带进线程）。
+    """
+    from easy_tdx.backtest.multi_strategy_engine import StrategySlot
+    from easy_tdx.backtest.strategies import get_registry
+    from easy_tdx.web.convert import category_from_str, market_from_str
+
+    registry = get_registry()
+    slots: list[StrategySlot] = []
+    for item in items:
+        # 1. 解析策略（未知策略跳过）
+        try:
+            entry = registry.get(item.strategy)
+        except KeyError:
+            continue
+        # 2. 逐页取行情（覆盖 start_date，最多 10 页 = 8000 根）
+        market_str, code = item.symbol.split(":", 1)
+        frames: list[pd.DataFrame] = []
+        for page in range(10):
+            try:
+                page_df = await client.get_security_bars(
+                    market_from_str(market_str),
+                    code,
+                    category_from_str(item.category),
+                    page * 800,
+                    800,
+                )
+            except Exception:
+                break
+            if len(page_df) == 0:
+                break
+            frames.append(page_df)
+            if item.start_date and len(page_df) > 0:
+                dt_col = "datetime" if "datetime" in page_df.columns else "date"
+                oldest = str(page_df[dt_col].iloc[-1])[:10]
+                if oldest <= item.start_date:
+                    break
+            if len(page_df) < 800:
+                break
+        if not frames:
+            continue
+        df = pd.concat(frames, ignore_index=True)
+        if "datetime" not in df.columns and "date" in df.columns:
+            df = df.copy()
+            df["datetime"] = df["date"]
+        df = df.sort_values("datetime").reset_index(drop=True)
+        # 日期范围过滤
+        if item.start_date or item.end_date:
+            df = _filter_df_by_date(df, item.start_date, item.end_date)
+        if len(df) < 2:
+            continue
+        # 3. 构造策略实例（参数非法跳过该条）
+        try:
+            strategy = entry.build(item.params)
+        except ValueError:
+            continue
+        label = item.strategy_label or entry.label
+        slots.append(StrategySlot(label=label, symbol=item.symbol, strategy=strategy, df=df))
+    return slots
+
+
+def _run_multi_strategy_backtest(
+    slots: list[Any], req: MultiStrategyBacktestRequest
+) -> dict[str, Any]:
+    """执行多策略组合回测并返回清洗后的结果字典（后台线程内调用）。"""
+    from easy_tdx.backtest.multi_strategy_engine import MultiStrategyEngine
+
+    engine = MultiStrategyEngine(
+        strategies=slots,
+        total_cash=req.cash,
+        commission=req.commission,
+        min_commission=req.min_commission,
+        stamp_tax=req.stamp_tax,
+        slippage=req.slippage,
+        execution=req.execution,
+    )
+    result = engine.run()
+    return serialize_result(result)
+
+
 def _run_optimize(df: pd.DataFrame, req: OptimizeBacktestRequest) -> dict[str, Any]:
     """执行参数网格寻优并返回清洗后的结果字典（后台线程内调用）。"""
     from easy_tdx.backtest.optimizer import ParamGridOptimizer
@@ -397,6 +559,148 @@ def _run_optimize(df: pd.DataFrame, req: OptimizeBacktestRequest) -> dict[str, A
     )
     result = optimizer.run()
     return result.to_dict()
+
+
+def _optimize_one_strategy(
+    strategy_name: str,
+    grid: dict[str, list[Any]],
+    df: pd.DataFrame,
+    cash: float,
+    commission: float,
+    slippage: float,
+    execution: str,
+) -> dict[str, Any] | None:
+    """跑单个策略的网格寻优，返回其最优点摘要（模块顶层，可被 ProcessPoolExecutor pickle）。
+
+    必须是模块级顶层函数：Windows 下 ProcessPoolExecutor 用 spawn 方式启动子进程，
+    子进程按 ``module.qualname`` 重新 import 本函数。lambda / 闭包 / 嵌套函数不可 pickle。
+
+    策略类（``registry.get(name).build()``）在子进程内构造，从不跨进程传递，
+    因此天然避开了 screen scanner 当年遇到的"策略类不可 pickle"问题。
+    返回纯 dict（所有值都是 JSON 原生类型），可安全 pickle 回主进程。
+    """
+    from easy_tdx.backtest.optimizer import ParamGridOptimizer
+
+    try:
+        optimizer = ParamGridOptimizer(
+            strategy_name=strategy_name,
+            param_grid=grid,
+            df=df,
+            cash=cash,
+            commission=commission,
+            slippage=slippage,
+            execution=execution,
+        )
+    except ValueError:
+        # 单策略网格超限（不应发生，预设已控制规模）→ 跳过
+        return None
+
+    result = optimizer.run()
+    if result.best is None:
+        return None
+
+    return {
+        "strategy": strategy_name,
+        "params": result.best.params,
+        "total_return": result.best.total_return,
+        "sharpe": result.best.sharpe,
+        "max_drawdown": result.best.max_drawdown,
+        "total_trades": result.best.total_trades,
+        "win_rate": result.best.win_rate,
+        "profit_factor": result.best.profit_factor,
+        "grid_points": len(result.results),
+    }
+
+
+def _run_optimize_all(df: pd.DataFrame, req: OptimizeAllBacktestRequest) -> dict[str, Any]:
+    """对所有策略的预设网格逐策略寻优，汇总成全局排名（后台线程内调用）。
+
+    遍历 ``STRATEGY_PRESETS`` 中每个策略，用其预设参数网格跑
+    :class:`ParamGridOptimizer`，取各策略的最优点（best）组装排名。单个策略
+    无有效结果（如全网格回测失败）则跳过。
+
+    并发：``req.workers >= 2`` 时用 ``ProcessPoolExecutor`` 跨进程并行寻优
+    （回测是 CPU-bound，numpy/pandas 持 GIL，线程无加速，必须用进程）。
+    ``workers`` 为 0 或 1 时串行。进程池在函数内 ``with`` 创建/销毁，对前端
+    轮询与 task_runner 透明。
+    """
+    from easy_tdx.backtest.strategies import get_registry
+    from easy_tdx.backtest.strategies.presets import STRATEGY_PRESETS
+
+    registry = get_registry()
+    # 过滤出已注册的策略 + 解析 label（label 必须在主进程取，避免子进程各自解析不一致）
+    jobs: list[tuple[str, dict[str, list[Any]]]] = []
+    labels: dict[str, str] = {}
+    for strategy_name, grid in STRATEGY_PRESETS.items():
+        if strategy_name not in registry.names():
+            continue
+        labels[strategy_name] = registry.get(strategy_name).label
+        jobs.append((strategy_name, grid))
+
+    # 跑寻优：串行 or 进程池并行
+    raw_results: list[dict[str, Any]] = []
+    if req.workers and req.workers >= 2:
+        import concurrent.futures
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=req.workers) as executor:
+            futures = {
+                executor.submit(
+                    _optimize_one_strategy,
+                    name,
+                    grid,
+                    df,
+                    req.cash,
+                    req.commission,
+                    req.slippage,
+                    req.execution,
+                ): name
+                for name, grid in jobs
+            }
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res is not None:
+                    raw_results.append(res)
+    else:
+        for name, grid in jobs:
+            res = _optimize_one_strategy(
+                name, grid, df, req.cash, req.commission, req.slippage, req.execution
+            )
+            if res is not None:
+                raw_results.append(res)
+
+    # 组装排名（主进程统一构造 Pydantic 模型，保证类型一致）
+    ranking: list[OptimizeAllRankEntry] = []
+    per_strategy: dict[str, OptimizeAllRankEntry] = {}
+    total_grid = 0
+    for res in raw_results:
+        strategy_name = res["strategy"]
+        entry = OptimizeAllRankEntry(
+            strategy=strategy_name,
+            strategy_label=labels[strategy_name],
+            params=res["params"],
+            total_return=res["total_return"],
+            sharpe=res["sharpe"],
+            max_drawdown=res["max_drawdown"],
+            total_trades=res["total_trades"],
+            win_rate=res["win_rate"],
+            profit_factor=res["profit_factor"],
+            grid_points=res["grid_points"],
+        )
+        ranking.append(entry)
+        per_strategy[strategy_name] = entry
+        total_grid += res["grid_points"]
+
+    # 按 total_return 降序
+    ranking.sort(key=lambda r: r.total_return, reverse=True)
+    best = ranking[0] if ranking else None
+
+    result_obj = OptimizeAllResult(
+        ranking=ranking,
+        best=best,
+        per_strategy=per_strategy,
+        total_grid_points=total_grid,
+    )
+    return result_obj.model_dump()
 
 
 def _filter_df_by_date(df: pd.DataFrame, start: str | None, end: str | None) -> pd.DataFrame:

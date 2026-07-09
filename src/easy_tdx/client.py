@@ -22,7 +22,14 @@ from ._df import (
     _merge_txn_datetime,
     _to_df,
 )
-from ._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
+from ._reconnect import (
+    _RETRY_DELAYS,
+    AsyncHeartbeatMixin,
+    find_working_host_async,
+    find_working_host_sync,
+    select_best_host_async,
+    select_best_host_sync,
+)
 from .codec.block import parse_block_dat
 from .codec.financial import parse_financial_dat, parse_financial_file_list
 from .codec.industry import parse_tdxhy_cfg
@@ -55,6 +62,7 @@ from .models.finance import (
     FinancialFileInfo,
     FinancialRecord,
 )
+from .models.quote import SecurityQuote
 from .models.security import SecurityInfo
 from .models.stats import FundFlow, HistoricalFundFlow, MarketStat
 from .models.timeseries import TransactionRecord
@@ -293,12 +301,24 @@ class TdxClient:
         try:
             self._execute(GetSecurityCountCmd(Market.SH))
         except TdxConnectionError:
-            self._conn.stop_heartbeat()
-            self._conn.close()
-            self._conn = TdxConnection(self._host, self._port, self._timeout)
-            self._conn.connect()
-            if self._heartbeat_interval > 0:
-                self._conn.start_heartbeat(self._heartbeat_interval)
+            self._reconnect()
+
+    def _reconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        统一收敛所有"重建 TdxConnection + 起心跳"的副本：``_execute`` 同主机
+        重试、``_execute`` 跨主机故障转移、``ensure_connected``、
+        ``get_market_stat`` 空数据重试都走这里，保证 4 处重建逻辑一致。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        self._conn.stop_heartbeat()
+        self._conn.close()
+        self._conn = TdxConnection(target, self._port, self._timeout)
+        self._conn.connect()
+        if self._heartbeat_interval > 0:
+            self._conn.start_heartbeat(self._heartbeat_interval)
 
     def __enter__(self) -> "TdxClient":
         self.connect()
@@ -313,11 +333,18 @@ class TdxClient:
         self.close()
 
     # ------------------------------------------------------------------ #
-    # 内部执行：含自动重连
+    # 内部执行：含自动重连 + 跨主机故障转移
     # ------------------------------------------------------------------ #
 
     def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
+
+        两阶段韧性：
+            1. 同主机重试（``_RETRY_DELAYS``，4 次指数退避）——应对瞬时抖动。
+            2. 跨主机故障转移——同主机重试仍失败时，重新测速选延迟最低的另
+               一台服务器再试一轮。服务器连不上时用户无需手动 ``ping``。
+        ``auto_reconnect=False`` 时两阶段都不触发，直接抛出原异常。
+        """
         try:
             return self._conn.execute(cmd)
         except TdxConnectionError:
@@ -326,11 +353,22 @@ class TdxClient:
             last_exc: TdxConnectionError | None = None
             for delay in _RETRY_DELAYS:
                 time.sleep(delay)
-                self._conn.close()
-                self._conn = TdxConnection(self._host, self._port, self._timeout)
-                self._conn.connect()
-                if self._heartbeat_interval > 0:
-                    self._conn.start_heartbeat(self._heartbeat_interval)
+                self._reconnect()
+                try:
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            # 第二阶段：跨主机故障转移——重新测速切到另一台服务器再试一次
+            new_host = select_best_host_sync(
+                get_known_hosts(),
+                ping_all,
+                save_best_host,
+                self._port,
+                5.0,
+                self._host,
+            )
+            if new_host is not None:
+                self._reconnect(new_host)
                 try:
                     return self._conn.execute(cmd)
                 except TdxConnectionError as e:
@@ -692,13 +730,18 @@ class TdxClient:
         通达信这三个"统计指数"的计数类字段（涨/跌/平/总数/涨停/跌停家数）
         返回的是真实家数的 1/10，需统一 ×10 还原。成交额/量/市值字段不受影响。
         `suspended_count` 由 `total - up - down - neutral` 推得，用于保证计数守恒。
+
+        空数据容错：880005/880001/880006 并非所有服务器都提供，会返回空 quotes。
+        此时不只切换到延迟最低的一台（它可能也不提供），而是按延迟顺序逐台实测，
+        找到第一台返回有效数据的服务器，避免用户手动 ``easy-tdx ping``。
         """
         # 通达信中 880005 是全市场行情统计，880001 是总市值指数，880006 是涨跌停统计
-        quotes = self._execute(
-            GetSecurityQuotesCmd(
-                [(Market.SH, "880005"), (Market.SH, "880001"), (Market.SH, "880006")]
-            )
+        _cmd = GetSecurityQuotesCmd(
+            [(Market.SH, "880005"), (Market.SH, "880001"), (Market.SH, "880006")]
         )
+        quotes = self._execute(_cmd)
+        if not quotes and self._auto_reconnect:
+            quotes = self._find_host_returning_quotes(_cmd)
         if not quotes:
             raise RuntimeError("无法获取市场统计数据")
         q = quotes[0]
@@ -724,6 +767,32 @@ class TdxClient:
                 limit_down_count=limit_down,
             )
         )
+
+    def _find_host_returning_quotes(
+        self, cmd: "BaseCommand[list[SecurityQuote]]"
+    ) -> list[SecurityQuote]:
+        """空数据故障转移：测速后按延迟顺序逐台实测，返回首台有效数据的 quotes。
+
+        专供 ``get_market_stat`` 使用——统计指数并非所有服务器都提供，延迟最低
+        的不一定返回数据，故需逐台实际查询。最多尝试 ``_WORKING_HOST_MAX_ATTEMPTS``
+        台（见 ``_reconnect``）。找到后 client 停在该 host；全失败返回空。
+        """
+        bad_host = self._host
+        ranked = ping_all(get_known_hosts(), self._port, 5.0)
+
+        def _try(host: str) -> bool:
+            # 切换到候选 host 并实测；非空即视为该 host 可用
+            self._reconnect(host)
+            return bool(self._execute(cmd))
+
+        new_host = find_working_host_sync(ranked, _try, save_best_host, bad_host)
+        if new_host is None:
+            # 全部候选都不可用，回退到原 host（保持状态可预测）
+            if self._host != bad_host:
+                self._reconnect(bad_host)
+            return []
+        # _try 已把 client 切到 new_host 并执行过 cmd，重新取一次拿结果
+        return self._execute(cmd)
 
     def _collect_transaction_records(
         self,
@@ -891,6 +960,22 @@ class AsyncTdxClient(AsyncHeartbeatMixin):
         await self._stop_heartbeat()
         await self._conn.close()
 
+    async def reconnect_to(self, host: str) -> None:
+        """热切换到新 host：关旧连接 → 换 host → 建新连接。
+
+        用于 web UI 的"服务器设置"页面——用户点选一个 host 后，无需重启
+        服务即可切换。复用 ``_execute_lock`` 保证切换期间没有并发行情请求
+        撞到半开的连接。切换失败抛异常（旧连接已 close，client 处于断开
+        状态，调用方应捕获并提示用户选别的 host）。
+        """
+        async with self._execute_lock:
+            await self._stop_heartbeat()
+            await self._conn.close()
+            self._host = host
+            self._conn = AsyncTdxConnection(host, self._port, self._timeout)
+            await self._conn.connect()
+            self._start_heartbeat()
+
     async def __aenter__(self) -> "AsyncTdxClient":
         await self.connect()
         return self
@@ -907,8 +992,29 @@ class AsyncTdxClient(AsyncHeartbeatMixin):
         """心跳使用的轻量请求（get_security_count，复用 _execute 重连）。"""
         return self.get_security_count(Market.SH)
 
+    async def _areconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        async 版的统一重建入口，与 sync ``_reconnect`` 对称，供 ``_execute``
+        同主机重试、跨主机故障转移、``get_market_stat`` 空数据重试复用。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        await self._stop_heartbeat()
+        await self._conn.close()
+        self._conn = AsyncTdxConnection(target, self._port, self._timeout)
+        await self._conn.connect()
+        self._start_heartbeat()
+
     async def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
+
+        两阶段韧性与 sync 版对称：先同主机重试（``_RETRY_DELAYS``），再跨主机
+        故障转移（重新测速切到另一台服务器）。整个流程在 ``_execute_lock`` 内
+        串行，避免并发请求触发多次故障转移抖动。``auto_reconnect=False`` 时
+        两阶段都不触发。
+        """
         async with self._execute_lock:
             try:
                 return await self._conn.execute(cmd)
@@ -918,9 +1024,22 @@ class AsyncTdxClient(AsyncHeartbeatMixin):
                 last_exc: TdxConnectionError | None = None
                 for delay in _RETRY_DELAYS:
                     await asyncio.sleep(delay)
-                    await self._conn.close()
-                    self._conn = AsyncTdxConnection(self._host, self._port, self._timeout)
-                    await self._conn.connect()
+                    await self._areconnect()
+                    try:
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                # 第二阶段：跨主机故障转移
+                new_host = await select_best_host_async(
+                    get_known_hosts(),
+                    ping_all,
+                    save_best_host,
+                    self._port,
+                    5.0,
+                    self._host,
+                )
+                if new_host is not None:
+                    await self._areconnect(new_host)
                     try:
                         return await self._conn.execute(cmd)
                     except TdxConnectionError as e:
@@ -1209,13 +1328,17 @@ class AsyncTdxClient(AsyncHeartbeatMixin):
         通达信这三个"统计指数"的计数类字段（涨/跌/平/总数/涨停/跌停家数）
         返回的是真实家数的 1/10，需统一 ×10 还原。成交额/量/市值字段不受影响。
         `suspended_count` 由 `total - up - down - neutral` 推得，用于保证计数守恒。
+
+        空数据容错：与 sync 版对称——空 quotes 时按延迟顺序逐台实测，找到首台
+        返回有效数据的服务器。
         """
         # 通达信中 880005 是全市场行情统计，880001 是总市值指数，880006 是涨跌停统计
-        quotes = await self._execute(
-            GetSecurityQuotesCmd(
-                [(Market.SH, "880005"), (Market.SH, "880001"), (Market.SH, "880006")]
-            )
+        _cmd = GetSecurityQuotesCmd(
+            [(Market.SH, "880005"), (Market.SH, "880001"), (Market.SH, "880006")]
         )
+        quotes = await self._execute(_cmd)
+        if not quotes and self._auto_reconnect:
+            quotes = await self._find_host_returning_quotes(_cmd)
         if not quotes:
             raise RuntimeError("无法获取市场统计数据")
         q = quotes[0]
@@ -1241,6 +1364,26 @@ class AsyncTdxClient(AsyncHeartbeatMixin):
                 limit_down_count=limit_down,
             )
         )
+
+    async def _find_host_returning_quotes(
+        self, cmd: "BaseCommand[list[SecurityQuote]]"
+    ) -> list[SecurityQuote]:
+        """空数据故障转移（async）：与 sync ``_find_host_returning_quotes`` 对称。"""
+        bad_host = self._host
+        ranked = await asyncio.to_thread(ping_all, get_known_hosts(), self._port, 5.0)
+
+        async def _try(host: str) -> bool:
+            await self._areconnect(host)
+            # mypy 对 async 闭包内泛型参数的推断会宽化为 BaseCommand[object]
+            # （sync 同模式可正确推断），此处为已知 mypy 限制，非真实类型错误。
+            return bool(await self._execute(cmd))  # type: ignore[arg-type]
+
+        new_host = await find_working_host_async(ranked, _try, save_best_host, bad_host)
+        if new_host is None:
+            if self._host != bad_host:
+                await self._areconnect(bad_host)
+            return []
+        return await self._execute(cmd)
 
     async def _collect_transaction_records(
         self,

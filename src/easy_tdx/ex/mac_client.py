@@ -15,7 +15,12 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .._df import _to_df
-from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
+from .._reconnect import (
+    _RETRY_DELAYS,
+    AsyncHeartbeatMixin,
+    select_best_host_async,
+    select_best_host_sync,
+)
 from ..commands.base import BaseCommand
 from ..config import get_best_mac_ex_host, get_mac_ex_hosts, save_best_mac_ex_host
 from ..exceptions import TdxConnectionError
@@ -26,6 +31,13 @@ from ..mac.commands.symbol_tick_chart import SymbolTickChartCmd
 from ..mac.commands.symbol_transaction import SymbolTransactionCmd
 from ..mac.enums import Adjust, Period, SortOrder, SortType
 from ..mac.models import MacQuoteField
+from ._hk_transaction import (
+    _fetch_all_hk_transactions_async,
+    _fetch_all_hk_transactions_sync,
+    _fetch_hk_transactions_async,
+    _fetch_hk_transactions_sync,
+    is_hk_stock_market,
+)
 from .commands.get_instrument_count import GetExInstrumentCountCmd
 from .commands.get_instrument_info import GetExInstrumentInfoCmd
 from .commands.login import MacExLoginCmd
@@ -141,11 +153,12 @@ class MacExClient:
         self._conn.execute(MacExLoginCmd())
 
     def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
 
         每次重连后必须重新 ``_login()``（MAC 协议扩展行情特有）。登录握手期的
         ``TdxConnectionError`` 与业务请求一样计入退避重试；``TdxCommandError``
-        （登录被拒等确定性失败）不重试，直接抛出。
+        （登录被拒等确定性失败）不重试，直接抛出。跨主机故障转移阶段同样遵循
+        ``connect + login`` 纳入重试的语义。
         """
         try:
             return self._conn.execute(cmd)
@@ -160,6 +173,27 @@ class MacExClient:
                     self._host, self._port, self._timeout, mac_ex_mode=True
                 )
                 # connect + login 纳入重试：登录握手期连接再次断开属可重试语义。
+                try:
+                    self._conn.connect()
+                    self._login()
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            # 第二阶段：跨主机故障转移——测速切到另一台 MAC 扩展行情服务器
+            new_host = select_best_host_sync(
+                get_mac_ex_hosts(),
+                ping_ex_all,
+                save_best_mac_ex_host,
+                self._port,
+                5.0,
+                self._host,
+            )
+            if new_host is not None:
+                self._host = new_host
+                self._conn.close()
+                self._conn = ExTdxConnection(
+                    self._host, self._port, self._timeout, mac_ex_mode=True
+                )
                 try:
                     self._conn.connect()
                     self._login()
@@ -421,10 +455,27 @@ class MacExClient:
         query_date : date | None
             查询日期，None 表示今天。
         start : int
-            起始偏移。
+            起始偏移。**注意：通达信逐笔协议为倒序**——``start=0`` 指向最新一笔
+            （收盘方向），``start`` 越大越早。A 股 0x122F 与港股 ex 协议语义一致。
         count : int
-            返回条数。
+            返回条数。港股单日成交常达数万笔（如 02715 约 1.3 万笔/日），默认
+            ``count=2000`` 只取最近 2000 笔，会集中在尾盘时段。若需全天全部成交，
+            请改用 :meth:`goods_transaction_all`。
+
+        Note
+        ----
+        港股股票类市场（HK_MAIN_BOARD/HK_GEM/HK_INDEX/HK_FUND/HK_STOCK_GGT/HK_DARK_POOL，
+        见 :data:`easy_tdx.ex._hk_transaction.HK_STOCK_MARKETS`）走 ex 扩展行情协议
+        （当日 0x23FC / 历史 0x2406），返回价格单位为港元（浮点）。其余扩展市场
+        （美股 / 期货等）走 MAC 协议 0x122F。原因：0x122F 的数据源未接入港股，
+        对港股请求会返回空（issue #14）。不确定市场归属时，可先用
+        :meth:`goods_kline` 探测哪个 market 能取到 K 线。
         """
+        if is_hk_stock_market(market):
+            result = _fetch_hk_transactions_sync(
+                self._execute, market, code, query_date, start, count
+            )
+            return _to_df(result)
         cmd = SymbolTransactionCmd(
             market=market,
             code=code,
@@ -433,6 +484,42 @@ class MacExClient:
             count=count,
         )
         result = self._execute(cmd)
+        return _to_df(result)
+
+    def goods_transaction_all(
+        self,
+        market: int,
+        code: str,
+        query_date: date | None = None,
+    ) -> pd.DataFrame:
+        """获取港股某日**全部**逐笔成交（仅港股股票类市场，自动翻页取全天）。
+
+        与 :meth:`goods_transaction` 的区别：不受 ``count`` 上限约束，自动翻页直至
+        末页，返回当日所有逐笔成交（港股单日常 1~5 万笔）。返回顺序仍为协议原生
+        倒序（最新在前）；如需正序展示，调用方自行 ``df.iloc[::-1]`` 反转。
+
+        Parameters
+        ----------
+        market : int
+            ExMarket 枚举值（须为港股股票类市场，见
+            :data:`easy_tdx.ex._hk_transaction.HK_STOCK_MARKETS`）。
+        code : str
+            证券代码。
+        query_date : date | None
+            查询日期，None 表示今天。
+
+        Raises
+        ------
+        ValueError
+            ``market`` 不属于港股股票类市场时抛出（本方法专为港股设计；其他扩展
+            市场请用 :meth:`goods_transaction`）。
+        """
+        if not is_hk_stock_market(market):
+            raise ValueError(
+                f"goods_transaction_all 仅支持港股股票类市场（HK_STOCK_MARKETS），"
+                f"收到 market={market}；其他市场请用 goods_transaction。"
+            )
+        result = _fetch_all_hk_transactions_sync(self._execute, market, code, query_date)
         return _to_df(result)
 
 
@@ -525,7 +612,7 @@ class AsyncMacExClient(AsyncHeartbeatMixin):
         await self._conn.execute(MacExLoginCmd())
 
     async def _execute(self, cmd: "BaseCommand[_T]") -> _T:
-        """执行命令；断线时指数退避重试（4 次，与 A 股/MAC 统一，审计 #2）。
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
 
         每次重连后必须重新 ``_login()``（MAC 协议扩展行情特有）。登录握手期的
         ``TdxConnectionError`` 与业务请求一样计入退避重试；``TdxCommandError``
@@ -545,6 +632,27 @@ class AsyncMacExClient(AsyncHeartbeatMixin):
                         self._host, self._port, self._timeout, mac_ex_mode=True
                     )
                     # connect + login 纳入重试：登录握手期连接再次断开属可重试语义。
+                    try:
+                        await self._conn.connect()
+                        await self._login()
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                # 第二阶段：跨主机故障转移
+                new_host = await select_best_host_async(
+                    get_mac_ex_hosts(),
+                    ping_ex_all,
+                    save_best_mac_ex_host,
+                    self._port,
+                    5.0,
+                    self._host,
+                )
+                if new_host is not None:
+                    self._host = new_host
+                    await self._conn.close()
+                    self._conn = AsyncExTdxConnection(
+                        self._host, self._port, self._timeout, mac_ex_mode=True
+                    )
                     try:
                         await self._conn.connect()
                         await self._login()
@@ -720,6 +828,15 @@ class AsyncMacExClient(AsyncHeartbeatMixin):
         start: int = 0,
         count: int = 2000,
     ) -> pd.DataFrame:
+        """获取逐笔成交数据（异步）。
+
+        路由与 ``start`` 倒序语义见同步版 :meth:`goods_transaction`。
+        """
+        if is_hk_stock_market(market):
+            result = await _fetch_hk_transactions_async(
+                self._execute, market, code, query_date, start, count
+            )
+            return _to_df(result)
         cmd = SymbolTransactionCmd(
             market=market,
             code=code,
@@ -728,4 +845,19 @@ class AsyncMacExClient(AsyncHeartbeatMixin):
             count=count,
         )
         result = await self._execute(cmd)
+        return _to_df(result)
+
+    async def goods_transaction_all(
+        self,
+        market: int,
+        code: str,
+        query_date: date | None = None,
+    ) -> pd.DataFrame:
+        """获取港股某日全部逐笔成交（异步）。语义见同步版 :meth:`goods_transaction_all`。"""
+        if not is_hk_stock_market(market):
+            raise ValueError(
+                f"goods_transaction_all 仅支持港股股票类市场（HK_STOCK_MARKETS），"
+                f"收到 market={market}；其他市场请用 goods_transaction。"
+            )
+        result = await _fetch_all_hk_transactions_async(self._execute, market, code, query_date)
         return _to_df(result)

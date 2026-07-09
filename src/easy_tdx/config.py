@@ -160,12 +160,29 @@ def _save(data: dict[str, Any]) -> None:
 
 
 def get_best_host() -> str:
-    """返回当前最佳主机地址。优先级：环境变量 > config.json > 默认列表首个。"""
+    """返回当前最佳主机地址。优先级：环境变量 > config.json > 默认列表首个。
+
+    含交叉污染校验：历史上 ``MacClient.from_best_host`` 曾误调 ``save_best_host``
+    把 MAC 服务器写入 ``best_host``（v1.19.3 "取不到行情" bug）。这里检测到
+    缓存的 host 不在标准 host 候选列表里时，自动重置为默认首个，避免用错协议。
+    """
     env = os.environ.get("EASY_TDX_HOST")
     if env:
         return env
     cfg = _load()
-    return cast(str, cfg.get("best_host", _FALLBACK_HOSTS[0]))
+    cached = cast(str, cfg.get("best_host", _FALLBACK_HOSTS[0]))
+
+    # 交叉污染校验：cached 必须在标准 host 候选列表（known_hosts + 源码默认）里。
+    # 如果是 MAC host（121.36.x.x 等），不在标准列表里 → 重置。
+    all_std_hosts = set(cfg.get("known_hosts", [])) | set(_FALLBACK_HOSTS)
+    if cached not in all_std_hosts:
+        # 被污染了（MAC/ex host 混入），重置为默认首个并持久化
+        cfg["best_host"] = _FALLBACK_HOSTS[0]
+        cfg["best_host_updated_at"] = datetime.now(_SHANGHAI_TZ).isoformat()
+        _save(cfg)
+        return _FALLBACK_HOSTS[0]
+
+    return cached
 
 
 def get_known_hosts() -> list[str]:
@@ -187,6 +204,20 @@ def get_mac_hosts() -> list[str]:
     """返回 MAC 行情服务器列表。"""
     cfg = _load()
     return cast(list[str], cfg.get("mac_hosts", list(_FALLBACK_MAC_HOSTS)))
+
+
+def get_best_mac_host() -> str:
+    """返回当前最佳 MAC 协议主机。
+
+    与 ``get_best_host``（标准 TDX 协议）分开存：MAC 和标准协议用不同的
+    服务器列表和协议格式，共用同一个字段会导致 MAC 客户端选出的 host
+    被标准客户端误用，用标准协议请求 MAC 服务器返回空 body。
+    """
+    env = os.environ.get("EASY_TDX_MAC_HOST")
+    if env:
+        return env
+    cfg = _load()
+    return cast(str, cfg.get("best_mac_host", _FALLBACK_MAC_HOSTS[0]))
 
 
 def get_ex_hosts() -> list[str]:
@@ -281,4 +312,19 @@ def save_best_mac_ex_host(host: str) -> None:
     cfg["best_mac_ex_host_updated_at"] = datetime.now().isoformat()
     if "mac_ex_hosts" not in cfg:
         cfg["mac_ex_hosts"] = list(_FALLBACK_MAC_EX_HOSTS)
+    _save(cfg)
+
+
+def save_best_mac_host(host: str) -> None:
+    """保存最佳 MAC 协议主机到配置文件（独立于标准 TDX 的 best_host）。
+
+    MAC 客户端必须用这个，不能复用 ``save_best_host``——否则选出的 MAC
+    服务器会污染标准 TDX 协议的 ``best_host``，导致标准客户端用错协议请求
+    MAC 服务器，返回空 body（v1.19.3 "取不到行情" bug 的根因）。
+    """
+    cfg = _load()
+    cfg["best_mac_host"] = host
+    cfg["best_mac_host_updated_at"] = datetime.now(_SHANGHAI_TZ).isoformat()
+    if "mac_hosts" not in cfg:
+        cfg["mac_hosts"] = list(_FALLBACK_MAC_HOSTS)
     _save(cfg)

@@ -2,6 +2,375 @@
 
 本文件记录 easy-tdx 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [1.20.0] — 2026-07-08
+
+**服务器失败时自动 ping 切换，无需手动 `easy-tdx ping`** —— 解决普通用户最困惑的痛点：连不上服务器或返回空数据时，之前必须手动跑 `easy-tdx ping` 才能恢复，普通人根本不知道该这么做。现在 Python API / CLI / Web API **三入口全部自动**——服务器连不上或返回空统计指数时，自动测速、切到延迟最低的可用服务器、重试，全程对用户透明。收敛在 `_reconnect.py` 单点注入 8 个 client 的 `_execute`，零冗余、不新增配置开关。
+
+### 新增
+
+- **跨主机故障转移（连接失败）**（`src/easy_tdx/_reconnect.py`）—— 8 个 client（TdxClient / MacClient / ExTdxClient / MacExClient，各 sync+async）的 `_execute` 在同主机重试耗尽（`_RETRY_DELAYS` 4 次指数退避）后，自动调 `select_best_host_sync/async` 重新测速、切到延迟最低的**另一台**服务器再试一轮。复用 `auto_reconnect` 开关（`False` 时不触发），内置 30s 节流防惊群。
+- **空数据故障转移（`get_market_stat`）**（`src/easy_tdx/_reconnect.py` + `client.py`）—— 880005/880001/880006 统计指数并非所有服务器都提供，返回空 quotes 时触发 `find_working_host_sync/async`：按延迟顺序逐台实测（最多 5 台），找到第一台返回有效数据的服务器。这是 v1.20.0 的核心场景——延迟最低的服务器不一定服务统计指数，必须逐台实测。
+- **统一重建 helper**（`client.py` / `mac/client.py` / `ex/client.py` / `ex/mac_client.py`）—— 新增 `_reconnect`/`_areconnect` 收敛各 client 内"重建连接 + 起心跳"的副本（原 `_execute` / `ensure_connected` 各有一份），消除 4 处重复，保证 failover 与重试逻辑一致。
+
+### 修复
+
+- **MacClient failover 不污染标准 best_host**（`src/easy_tdx/mac/client.py`）—— MAC 客户端的 failover 用 `save_best_mac_host`（写入独立配置项），而非 `save_best_host`。延续 v1.19.4 的修复（MAC 服务器不再写进标准 best_host），含防回归测试锁定。
+
+## [1.19.7] — 2026-07-07
+
+**新增「服务器设置」页面：web UI 上测速 + 切换通达信服务器** —— 解决"有些用户获取到的 IP 能连通、有些不能"的问题。不同地区/运营商对通达信各服务器连通性不同，之前用户只能碰运气或手动改 config.json。现在在 web UI 上新增第六个页面「服务器设置」，列出全部 50+ 候选服务器、一键并发测速、点选切换——切换后立即生效（热重连），无需重启服务。
+
+### 新增
+
+- **`AsyncTdxClient.reconnect_to(host)`**（`src/easy_tdx/client.py`）—— 热切换 host 的核心方法：复用 `_execute_lock` 保证切换期间无并发请求撞半开连接，关旧连接→换 host→建新连接→重启心跳。切换失败抛异常（client 断开，路由层捕获返回友好提示）。
+- **服务器设置路由**（`src/easy_tdx/web/routers/server.py`）—— 3 个端点：
+  - `GET /api/v1/server/hosts`：列出候选 host + 当前 host（不测速，首屏秒开）
+  - `POST /api/v1/server/test`：并发 ping 测速，返回延迟（ms）和可达性，按延迟排序
+  - `POST /api/v1/server/switch`：切换到指定 host（先 reconnect 成功再 save_best_host，避免连接失败污染 config）
+- **服务器设置页面**（`web-ui/src/views/ServerSettingsView.vue`）—— 左侧当前 host + 测速按钮，右侧 host 列表表格（IP/延迟颜色编码/状态徽章/使用按钮）。延迟 <100ms 绿色、<300ms 蓝色、≥300ms 红色、不可达灰色。
+- **导航入口**：顶部导航栏新增「服务器设置」（第 6 个页面）。
+
+### 设计决策
+
+- **不自动测速**：页面加载只列 host，点按钮才测速（50+ host 全 ping 要几秒，自动测速会卡首屏）。
+- **切换顺序**：先 `reconnect_to` 成功 → 再 `save_best_host` 持久化（v1.19.4 host 污染 bug 的教训）。
+- **host 校验**：只允许切换到候选列表里的 IP，防止任意地址注入。
+
+## [1.19.6] — 2026-07-07
+
+**修复 EXE 丢失所有第三方依赖（pandas/numpy/uvicorn 等）** —— v1.19.5 的 EXE 只有 11MB（正常 44MB），双击报 `ModuleNotFoundError: No module named 'pandas'`。根因：`release.yml` 的步骤顺序是先 `pip install -e ".[web,packaging]"` 再 `Build frontend`，但 `pyproject.toml` 的 `force-include` 要求 `web-ui/dist` 在 `pip install` 时就存在——install 阶段 dist 不存在导致 editable install 静默降级，PyInstaller 收集不到第三方包。修复：调换 `release.yml` 步骤顺序，先 `npm run build` 再 `pip install`。
+
+### 修复
+
+- **release.yml 步骤顺序**（`.github/workflows/release.yml`）—— `Build frontend` 移到 `Install Python deps` 之前，确保 `pip install -e .` 时 `web-ui/dist` 已存在。
+
+## [1.19.5] — 2026-07-07
+
+**修复 PyPI 安装后 `localhost:8000` 返回 404** —— `pip install easy-tdx[web]` 后启动 `easy-tdx serve`，浏览器打开 `localhost:8000` 直接 404。根因：PyPI wheel 不含前端 dist（只有 Python 包），`_resolve_web_dist_dir()` 三级探测全失败返回 None，StaticFiles 不挂载。v1.19.2 的 MIME 修复、v1.19.3 的 SPA fallback 都只对 EXE 打包态生效——PyPI 安装态连 dist 都没有，更谈不上 MIME 或 SPA。
+
+### 修复
+
+- **前端 dist 打进 wheel**（`pyproject.toml` + `.github/workflows/publish.yml`）—— hatchling 配置 `force-include` 把 `web-ui/dist` 映射到包内 `easy_tdx/web/dist`；`publish.yml` 在 `python -m build` 前先 `npm ci && npm run build` 构建前端。PyPI 用户 `pip install easy-tdx[web]` 后开箱即用 UI，无需 clone 仓库或手动构建前端。
+- **`_resolve_web_dist_dir()` 第 4 级探测**（`src/easy_tdx/web/app.py`）—— 新增"包内 `easy_tdx/web/dist`"分支，在环境变量 / _MEIPASS / 仓库根三级都失败后，回退到 PyPI 安装的包内 dist。
+
+## [1.19.4] — 2026-07-07
+
+**修复取不到行情数据的根因：MAC 客户端污染标准协议的 best_host** —— v1.19.3 在实际机器上"所有股票都取不到数据"（K 线响应偏移 2 剩余 0）。根因是 `mac/client.py` 的 `MacClient.from_best_host()` 和 `AsyncMacClient.from_best_host()` 调用了 `save_best_host(best)`——把选中的 **MAC 协议服务器**（如 `121.36.248.138`）写进了全局 `best_host` 字段，但这个字段是**标准 TDX 协议**用的。之后标准 `AsyncTdxClient` 用 `get_best_host()` 读到这个 MAC host，用标准协议请求 MAC 服务器，返回空 body。web app 启动时 lifespan 会启动 MAC 客户端，这就是污染时机。
+
+### 修复
+
+- **MAC host 不再污染标准 best_host**（`src/easy_tdx/config.py` + `src/easy_tdx/mac/client.py`）—— 新增独立的 `best_mac_host` 字段 + `get_best_mac_host()` / `save_best_mac_host()`。`MacClient` / `AsyncMacClient` 的 `from_best_host()` 和 `__init__` 改用新字段（4 处），不再调 `save_best_host` / `get_best_host`。
+- **best_host 交叉污染校验**（`src/easy_tdx/config.py:get_best_host`）—— 读取时检测缓存 host 是否在标准 host 候选列表（known_hosts + 源码默认）里，不在则自动重置为默认首个并持久化。**这会自动修复已被污染的 config.json**，用户无需手动删配置。
+- **回归测试**（`tests/unit/test_config.py`）—— 新增 `TestBestHostPollutionGuard`（3 个测试：MAC host 被重置 / 合法 host 不重置 / 重置持久化）+ `TestMacHostSeparation`（2 个测试：save_best_mac_host 不碰 best_host / get_best_mac_host 返回独立字段）。更新既有 `test_config_json_host`（host 需在 known_hosts 里才通过校验）。
+
+## [1.19.3] — 2026-07-07
+
+**修复 EXE 运行时两个问题：K 线空 body 仍 500 + 前端路由刷新 404** —— v1.19.2 在实际机器上运行日志暴露两个问题：(1) SH600519 等正常股票偶发请求 K 线时，通达信服务器返回 `ret_count>0` 但 body 完全为空（pos=2 剩余 0 字节），v1.18.3 的容错有 `if bars:` 条件——bars 为空时走 `raise` → 500，老人看到"取行情失败"。(2) 用户在 `/optimize`、`/portfolio` 等前端路由页面刷新时，后端 StaticFiles 找不到文件返回 404（SPA fallback 缺失）。
+
+### 修复
+
+- **K 线空 body 不再 500**（`src/easy_tdx/commands/security_bars.py`）—— 移除 `if bars:` 条件，无论已解析条数多少，`TdxDecodeError` 都 `return bars`（空列表让前端分页重试比直接 500 友好）。日志证据：`偏移 2，实际剩余 0 字节` = body 只有 ret_count 头、第 1 条 datetime 就崩。`GetIndexBarsCmd`（指数 K 线）同改。更新 `test_security_bars_truncated_first_record_still_raises`（原断言 raise，现断言返回空列表）+ 新增 `test_security_bars_ret_count_lies_body_completely_empty` 回归守卫。
+- **SPA fallback**（`src/easy_tdx/web/app.py`）—— 子类化 `StaticFiles` 为 `SPAStaticFiles`，404 时返回 `index.html` 让 Vue Router 接管。修复 `/optimize`、`/portfolio`、`/compare`、`/strategies` 等前端路由刷新 404。API 路径（`/api/v1/*`）已在路由表注册，不受影响。
+
+## [1.19.2] — 2026-07-07
+
+**修复干净 Windows 上 EXE 双击后页面纯黑** —— v1.19.1 在没装开发工具的 Windows（如老人电脑）上双击 EXE，浏览器打开 `localhost:8000` 后页面纯黑、`/docs` 却能正常打开。根因：干净 Windows 的注册表里没有 `.js` 文件的 `Content Type` 映射，Python 的 `mimetypes.guess_type('.js')` 返回 `None`，FastAPI/Starlette 的 `StaticFiles` 回退到 `text/plain`。但 `index.html` 里的 `<script type="module">` 启用严格 MIME 检查，浏览器拒绝执行 `text/plain` 的 JS（报错 `Expected a JavaScript-or-Wasm module script but the server responded with a MIME type of "text/plain"`），Vue 根本不挂载 → 纯黑。修复：在 mount 前用 `mimetypes.add_type` 强制注册 `.js/.mjs/.css/.svg` 的正确 MIME，无论机器装没装开发工具都生效。
+
+### 修复
+
+- **EXE 页面纯黑（MIME 类型）**（`src/easy_tdx/web/app.py`）—— mount StaticFiles 前强制 `mimetypes.add_type("application/javascript", ".js")` 等 4 项。在干净 Windows（用户名 INTEL、无开发环境）实测复现并修复：JS/CSS 现在返回正确的 `Content-Type`，浏览器不再拒绝执行 module script。
+- **spec 前端文件打包**（`easy_tdx.spec`）—— v1.19.1 的 `datas += [("web-ui/dist", "web_dist")]` 实际能工作（PyInstaller 把目录路径当 glob 处理），但为可靠性改为用 `pathlib.rglob` 逐文件展开成 `(src_file, dest_dir)` 元组列表，并加 dist 不存在时的 WARNING 提示。
+
+## [1.19.1] — 2026-07-07
+
+**支持打包成单一 Windows EXE + GitHub Actions 自动发版** —— 面向"一点都不懂的老年"用户群，让 easy-tdx 能从"开发者双进程"形态变成"双击 EXE → 浏览器自动打开 → 看到回测界面"的零门槛形态。本版为 Phase 1（未签名自测版）；Phase 2 引入代码签名消除 SmartScreen 提示，Phase 3 加 macOS。
+
+### 新增
+
+- **后端同源托管前端 dist**（`src/easy_tdx/web/app.py`）—— `_resolve_web_dist_dir()` 三级探测（环境变量 → PyInstaller `_MEIPASS/web_dist` → 仓库根 `web-ui/dist`），在所有 API 路由注册后 `app.mount("/", StaticFiles(..., html=True))`。开发态可缺省（仅 API），打包态同源服务前端。**前置条件**：此前前端 Vite 单独跑、靠 CORS 跨端口，老人无法双进程操作；现单进程同源解决。
+- **`--open-browser` 启动选项**（`src/easy_tdx/cli/cmd_web.py`）—— uvicorn 启动后 `threading.Timer(1.5, ...)` 延迟开浏览器（等端口就绪），默认开、`--no-open-browser` 关闭、`--reload` 模式禁用（开发态不抢焦点）。
+- **PyInstaller 打包入口**（`src/easy_tdx/__main__.py` + `easy_tdx.spec`）—— `python -m easy_tdx` 等价 CLI；无参数时默认走 `serve`。`.spec` 用 `--onefile` + `console=False`（无黑窗）+ `collect_submodules('uvicorn' / 'easy_tdx')` 收集动态 import + 前端 dist 打到 `web_dist`。
+- **GitHub Actions 发版工作流**（`.github/workflows/release.yml`）—— `v*` tag 触发，`windows-latest` 构建前端 + EXE，重命名为 `easy-tdx-<版本>-windows.exe`，`softprops/action-gh-release` 上传。与 `publish.yml`（PyPI）完全独立并行，PyPI 失败不影响 EXE 发布。
+- **系统托盘图标**（`src/easy_tdx/tray.py`）—— 打包态双击 EXE 后右下角任务栏出现 K 线风格图标，右键"打开浏览器 / 退出"可干净关闭，老人无需学任务管理器。
+- **打包使用文档**（`docs/packaging.md`）—— 老人下载/运行/绕过 SmartScreen 图文说明 + 开发者本地构建步骤 + Phase 1/2/3 路线图。
+
+### 已知约束（非 bug）
+
+- **EXE 未签名，SmartScreen 会拦截** —— 老人首次运行需手动"更多信息 → 仍要运行"。这是 Phase 1 的明确取舍，Phase 2 引入 OV/EV 代码签名证书后消除。
+- **EXE 体积 80-150MB** —— pandas/numpy/uvicorn/Vue dist 全量打包的必然结果。`--onefile` 首次启动解压需 2-5 秒。
+- **离线 .day 读取需要通达信** —— 老人若未安装 Windows 版通达信，离线读取本地数据功能不可用；在线行情不受影响。
+
+### 文档
+
+- **README + 上手手册大改** —— 删除"两个终端 + npm run dev + 5173"的过时流程，改为三档分流：① 下载 EXE（零基础首选）② 装 Python 一条命令启动（会点电脑的）③ 源码运行 + 自己打包（开发者）。手册补虚拟环境配置、EXE 打包附录、EXE 排错 FAQ。
+
+## [1.18.3] — 2026-07-06
+
+**K 线响应截断容错 + 一键寻优并发默认值优化** —— 两个小修复合并发布。(1) 修复 `000408` 等标的请求 `count=800` 日线时，TDX 服务端返回截断响应（响应头声称有数据但 body 末尾若干条记录被切掉）导致整页 500 的问题：解析器现在丢弃残缺的末条记录，返回已成功解析的前 N-1 条，避免一条坏数据让整页请求失败。(2) 一键寻优并发默认值从「串行」改为「8 进程」，并把用户选择持久化到 `localStorage`，下次以其最后一次选择为默认。
+
+### 修复
+
+- **K 线响应截断容错**（`src/easy_tdx/commands/security_bars.py`）—— `GetSecurityBarsCmd` / `GetIndexBarsCmd` 的 `parse_response` 在逐条解析时，若某条记录的 datetime/price/volume 字段因数据不足抛 `TdxDecodeError`，改为丢弃残缺的末条并返回已成功解析的前若干条（记 warning 日志），而非整体抛 500。仅当连第一条都无法解析时才继续抛错（说明是真正的坏包而非尾部截断）。覆盖日线/分钟线/指数 K 线全部分支。
+
+### 变更
+
+- **一键寻优并发默认 8 进程 + 持久化**（`web-ui/src/views/OptimizeView.vue`）—— 「一键寻优并发」工作进程默认值从串行（0）改为 8 进程；用户修改后写入 `localStorage`（key `optimize.workers`），下次打开以其最后一次选择为默认。无历史记录或值非法时回退默认 8；`localStorage` 不可用时（隐私模式等）静默回退，不影响使用。
+
+## [1.18.2] — 2026-07-06
+
+**回退拼音声母搜索功能，回到稳定的 6 位代码输入** —— v1.19.0 引入的拼音声母搜索（输 `zjxc` 命中中际旭创）因底层依赖过重被移除。该功能首次使用时需从通达信服务器爬取沪深 A 股约 5000 条完整名单（几十次协议往返，慢机器耗时几十秒到超时），且与共享的 TDX 连接耦合——爬名单期间会阻塞行情请求。虽经多轮优化（按需加载 / 全站遮罩 / 单飞去重 / 后台预热），均无法兼顾"不阻塞核心行情"与"首次可用"。本次回到 v1.18.1 的干净基线，代码输入框恢复为纯 6 位代码输入（市场自动识别）。
+
+### 变更
+
+- **移除拼音声母搜索** —— 删除 `StockSearchInput` / `AppInitOverlay` / `useStockSearch` 三个组件与 composable，移除 `pypinyin` 依赖、`/security/search-index` 端点、lifespan 启动预热。`SymbolPicker` / `StocksPicker` 恢复为纯 6 位代码输入框。
+
+### 已知约束（非 bug）
+
+- **代码输入只支持 6 位数字** —— 不支持拼音/名字搜索。这是有意为之的取舍：避免引入需实时爬全名单的重依赖。如未来重做，应将股票名单做成独立本地数据库（用离线命令定期更新），搜索只查本地，不依赖实时爬 TDX。
+
+## [1.18.1] — 2026-07-06
+
+**Web UI 一键寻优多进程并发 + 策略库组合评级 + 市场前缀纠正** —— 两个独立主题合并发布。(1) 「一键寻优所有策略」此前串行跑 17 个策略的预设网格（共约 182 个网格点），在中大型机器上动辄几十秒到几分钟。本次引入 `ProcessPoolExecutor` 多进程并发，配置区新增并发数选择器（串行 / 4 / 8 / 16 进程，自动检测 CPU 核数并标注推荐档），实测 8 进程可提速 4-6×。**关键认知**：回测是 numpy/pandas 的 CPU 密集计算并持有 GIL，多线程无加速，必须用多进程；照搬项目里已跑通的 `screen/scanner.py` 进程池模板。(2) 策略库「组合回测」结果区补上组合评级徽章（与单标的回测/组合页同口径的 5 维度评分），同时修复历史保存策略的市场前缀错配（5 开头的沪市基金/ETF 曾被误判为深市）。
+
+### 新增
+
+- **一键寻优多进程并发**（`src/easy_tdx/web/routers/backtest.py` + `backtest_schemas.py`）—— `OptimizeAllBacktestRequest` 新增 `workers` 字段（默认 1=串行，范围 0-32）。抽出模块顶层函数 `_optimize_one_strategy`（可被 `ProcessPoolExecutor` pickle），`_run_optimize_all` 在 `workers >= 2` 时用进程池并行寻优，`workers` 为 0 或 1 时走原串行逻辑（向后兼容）。进程池在函数内 `with` 创建/销毁，对前端轮询与 `task_runner` 透明。
+- **并发数选择器**（`web-ui/src/views/OptimizeView.vue`）—— 配置区新增「一键寻优并发」区：自动检测 CPU 核数（`navigator.hardwareConcurrency`）+ 串行/4/8/16 进程下拉，默认串行，标注推荐档（`min(CPU, 8)`）。默认串行的考量：Windows spawn 启动开销大，小机器上多进程可能反而更慢，让用户先实测再开并发。
+- **策略库组合评级**（`web-ui/src/views/StrategiesView.vue`）—— 组合回测结果区新增「组合评级」详情块，从 `combined_equity` 重算夏普/卡玛/回撤/波动率等 5 维度评分，复用 `gradePortfolio`（与 `/portfolio` 页和单标的回测页同口径），让用户一眼判断这个组合该不该经常参与。
+
+### 变更
+
+- **市场前缀判断统一**（`web-ui/src/views/BacktestView.vue` + `StrategiesView.vue`）—— `BacktestView.fullSymbol` 此前硬编码规则（6/9 开头 SH，8/4 开头 BJ，其余 SZ），漏判 5 开头的沪市基金/ETF（如 `515030` 被误判为 SZ）。改为复用 `market.ts` 的 `detectMarket`（与 `SymbolPicker` / `StocksPicker` 同一套规则）。`StrategiesView` 新增 `normalizeSymbol`，在发请求前重算历史保存策略的市场前缀，纠正历史数据 + 兜底未来。
+- **`backtest_schemas.py` 代码风格** —— 修复 `SavedStrategyCreate.kind` 字段描述行超过 ruff 100 字符上限（E501）的历史遗留。
+
+### 已知约束（非 bug）
+
+- **并发默认串行** —— 多进程在 Windows 上 spawn 子进程有启动开销，CPU 核数少的机器开并发可能反而更慢。因此 UI 默认选串行，让用户先用同一标的、串行 vs 并行各跑一次对比耗时，再决定是否开并发。
+- **并发仅对「一键寻优所有策略」生效** —— 单策略寻优（`/backtest/optimize/run/async`）内部网格点也可并行，但收益小、复杂度高，本次未做。
+
+## [1.18.0] — 2026-07-05
+
+**Web UI 策略库新增「策略组合」保存能力 + 分类 Tab** —— 此前用户在策略库勾选多个单标的策略做组合回测，跑出满意结果后却**无法保存**这个组合，下次要重新勾选重新跑。更关键的是，用户真正的诉求是「下次打开就知道哪些该买、哪些该卖」——这本质是要**截至今天的策略信号**，而非静态存档。本次落地：在策略库融入 `kind: 'multi'` 类型，组合回测结果区加「💾 保存为组合」按钮，组合卡片「↻ 重跑到今天」一键用今天作为结束日重跑，跑出来的"当前持仓"就是截至今天的策略信号（持仓/空仓/浮盈/浮亏）。同时把策略库拆成「单标的」/「组合」两个 Tab，避免数量多了之后混排难找。
+
+### 新增
+
+- **策略组合保存**（`web-ui/src/views/StrategiesView.vue` + 后端 schema 扩展）—— 组合回测结果区右上「💾 保存为组合」橙色按钮，弹窗输入名称 + 备注。存为 `kind: 'multi'`，`context.items` 存完整 `MultiStrategyItem[]`（各策略的 strategy+params+symbol+日期），`snapshot` 存组合级绩效（总收益/年化/策略数/资金）。复用现有 SQLite 单表（`kind` 字段本就是 TEXT），**零数据库迁移，零后端逻辑改动**。
+- **载入即重跑到今天** —— multi 卡片按钮不是普通「载入」而是「↻ 重跑到今天」：confirm 后自动把 `end_date` 全部覆盖为今天，触发组合回测，跑完滚动到结果区。这样"当前持仓"表 = 截至今天的策略信号，直接回答用户「哪些该买该卖」。
+- **持仓三态高亮** —— 当前持仓表的状态徽章从两态（持仓/空仓）升级为三态：🟢 **持有**（浮盈，绿底）/ 🟠 **持有·浮亏**（橙底，提示注意止损）/ ⚪ **空仓·等买点**（灰底，行半透明）。让用户一眼分辨"该继续拿"还是"该警惕"。
+- **策略库 Tab 分类** —— 顶部新增「单标的 [N]」/「组合 [N]」两个 Tab（带计数徽章 + 蓝色下划线 active 指示），切换时清空勾选避免跨 Tab 残留。「组合回测」按钮仅在单标的 Tab 显示（组合策略无法再被组合）；空态文案按 Tab 分别引导。
+- **过拟合警示 + 模型仓位免责** —— 组合回测结果区顶部橙色警示条明确告知「历史回测优秀 ≠ 未来一定有效，收益可能来自特定时段市场环境」；持仓表上方水印标注「表中是**模型仓位**，不是你真实账户的持仓，过夜后可能因新 K 线触发买卖而变化」。载入组合的 confirm 弹窗也提示策略信号非投资建议。
+- **保存组合弹窗 A11y** —— `role="dialog"` + `aria-modal="true"` + `aria-labelledby`，ESC 关闭，打开时自动 focus 到名称输入框。
+
+### 变更
+
+- **后端 schema kind 扩展**（`src/easy_tdx/web/backtest_schemas.py`）—— `SavedStrategyCreate.kind` / `SavedStrategy.kind` 的 `Literal` 由 `["single", "portfolio"]` 扩展为 `["single", "portfolio", "multi"]`。前端 `web-ui/src/types.ts` 镜像同步。
+- **卡片 Badge 细化** —— multi 显示「多策略」橙色徽章 + 🗂 图标 + 橙色卡片边框；portfolio 显示「多标的」紫色徽章。两类组合在「组合」Tab 内可一眼区分。
+- **代码审计修复（10 项）** —— 修复 `multi-icon` 误用未引入的 Material Icons 字体导致显示英文文本；补齐 `onComboBacktest` 漏写的 `lastComboCash`；持仓三态计算收敛为 `holdingViews` computed（避免模板每行 3 次函数调用）；`.overfit-warn` 与 `.signal-disclaimer` 合并为 `.warn-box` 基础类 + modifier；`ctx.items` 加运行时校验；`document.querySelector` 改用 ref；删除 `selectedIds` 静默替换的副作用。
+
+### 已知约束（非 bug）
+
+- **策略信号 ≠ 投资建议，也非真实账户持仓** —— 系统显示的"持仓"是**模型仓位**（策略说该持仓），不是用户真实账户的持仓。UI 已在多处（过拟合警示条 + 持仓表水印 + 载入 confirm）明确标注。用户应把它当作参考信号，而非"未来必涨"的保证。
+- **信号会漂移** —— 今天重跑说"持仓"，明天大跌触发止损可能变"空仓"。需要定期打开重跑。水印标注的是计算当天的收盘价信号。
+- **不做真实账户追踪** —— 不存用户实际买卖了多少股、真实成本。那是投资日记/MRP 级别功能，工程量 5x，本次未做。
+
+## [1.17.15] — 2026-07-05
+
+**Web UI 参数寻优体验升级：一键寻优按钮改橙色 + 等待期间投资大师名言轮播** —— 参数寻优是一个后台 Task，跑一遍全策略预设网格往往要 30 秒到几分钟。此前点击「一键寻优所有策略」后，按钮变灰、右侧整片纯色空白，用户根本不知道系统在干什么，容易以为卡住。本次给两段体验都做了升级：按钮改为暖橙渐变（`#f59e0b → #ea580c`）在深色金融主题下比 primary 蓝更醒目；寻优进行中右侧展示 100 条全球投资大师名言（巴菲特/芒格/格雷厄姆/林奇/索罗斯/利弗莫尔/塔勒布/达利欧等），3 秒随机轮播一条，Fisher-Yates 洗牌避免短期重复，让等待不枯燥、还能学到东西。
+
+### 新增
+
+- **100 条投资大师名言数据**（`web-ui/src/data/investment-quotes.ts`）—— 覆盖价值投资（巴菲特/芒格/格雷厄姆/林奇/费雪/博格尔/邓普顿）、宏观对冲（索罗斯/罗杰斯/达利欧/塔勒布）、技术趋势（利弗莫尔/江恩）、行为金融（霍华德·马克斯）等流派，纯中文面向中文用户。每条 `{ text, author }` 结构。
+- **名言轮播组件**（`web-ui/src/components/QuoteCarousel.vue`）—— Props 驱动 `interval`（默认 3000ms），mount 时 Fisher-Yates 洗牌取第 0 条，每 `interval` ms 推进，一轮播完重新洗牌；`onUnmounted` 清 `setInterval` 防泄漏。视觉：顶部 3 秒线性进度条（橙色填充暗示"还在跑"）+ 装饰大引号 + fade/slide 过渡（350ms）+ 底部脉动橙点「后台寻优进行中，大师智慧伴你等待…」。CSS 变量 `--quote-interval` 把 props 透传给动画时长，保证进度条与切换同步。
+- **一键寻优按钮橙色样式**（`web-ui/src/views/OptimizeView.vue`）—— 新增 `.run-all-btn` 暖橙渐变 + 橙色光晕；hover 加亮上移 1px；运行中保留暗橙识别度（不像普通按钮变纯灰）。
+
+### 已知约束（非 bug）
+
+- **轮播组件目前仅接入「一键寻优」** —— 设计成 Props 驱动、零业务耦合，未来可复用到「开始寻优」「组合回测」等同样有后台 Task 等待的页面，本次未做。
+
+## [1.17.14] — 2026-07-05
+
+**Web UI 新增「数据评级」系统（S/A/B/C/D 五档）** —— 此前回测结果只有冷冰冰的 19 项指标，普通用户看到「总收益 126%」会觉得不错，却看不出胜率仅 35%、最大回撤 41% 背后的「套牢拿不住」风险。本次给单标的回测、组合回测、参数寻优三个入口都加上一个一眼可读的评级徽章，让普通人 1 秒判断「这个品种适不适合经常参与」。评级**不看收益率**（避免被近期大涨误导），只看风险调整后的持有体验：卡玛比率（套牢回本难度）、最大回撤、胜率、利润因子、夏普、波动率六个维度加权评分，再叠加一票否决（系统亏损/深回撤/低胜率）。京东方那种「收益好看但风险高」的案例会评 **D 档**，明确告诉用户「别碰」。长线低频策略（如 6 年 6 笔交易）不会被一刀切否决——交易笔数少时只把胜率/利润因子降权，不影响基于净值的评级。
+
+### 新增
+
+- **评级核心模块**（`web-ui/src/grading/`）—— 纯前端 TypeScript 实现，零后端改动。`engine.ts`（线性插值 + 加权 + 一票否决）、`thresholds.ts`（8 维度阈值锚点表，集中可调）、`combinedMetrics.ts`（从组合净值曲线重算夏普/卡玛/波动率）、`index.ts`（三个场景入口）。
+- **三个场景评级** —— 单标的回测用 6 维度（卡玛 18% + 最大回撤 17% + 胜率 17% + 利润因子 18% + 夏普 15% + 波动率 15%）；组合回测从 `combined_equity` 重算 5 维度（卡玛 25% + 最大回撤 22% + 夏普 22% + 索提诺 15% + 波动率 16%，因净值算不出胜率/利润因子）；参数寻优用 4 维度降级版（夏普 30% + 最大回撤 28% + 胜率 22% + 利润因子 20%，因 GridPointResult 只有 6 字段）。
+- **一票否决规则** —— 系统亏损（`profit_factor < 1` → D）、深回撤（`max_drawdown > 60%` → D）、高回撤（> 50% 最高 B）、低胜率（< 30% 且样本充足最高 C）、微利（利润因子 < 1.2 最高 B）。
+- **样本不足降权（不否决）** —— 交易笔数 < 10 时，把依赖逐笔成交的维度（胜率/利润因子）权重降到 0，重分配给净值类维度；评级照常给出，旁边标「⚠ 交易样本有限」。修复了「长线策略 6 年 6 笔被打到 D」的过度惩罚。
+- **评级 UI 组件**（`GradeBadge.vue` / `GradeDetails.vue`）—— 圆形徽章（S 金/A 绿/B 蓝/C 橙/D 红，遵循 A 股颜色惯例）+ 展开式详情（维度得分条 + 否决原因 + 样本提示）。接入 `BacktestView` / `PortfolioView` / `OptimizeView`，寻优排名表新增「评级」列。
+- **评级自检测试**（`web-ui/src/grading/__tests__/grade.test.ts`）—— 15 个测试用 Node 内置 `node:test` + rolldown 打包跑，覆盖核心场景：京东方 = D（核心断言）、长线策略 = B、否决规则、组合评级、插值边界。
+
+### 变更
+
+- **`tsconfig.app.json` 排除测试目录** —— `src/**/__tests__/**` 和 `scripts/**` 不进 app bundle（测试用 rolldown 独立打包跑，不经 vue-tsc）。
+
+### 已知约束（非 bug）
+
+- **评级阈值需在真实数据上观察后微调** —— 所有阈值集中在 `thresholds.ts`，当前用金融惯例值校准。如果某批真实回测的评级不符合直觉，可在该文件单点调整，无需动评分引擎。
+- **寻优排名表全量算评级** —— 大表（200 行）未做虚拟化，目前性能可接受。若未来卡顿再优化。
+
+## [1.17.13] — 2026-07-04
+
+**修复多策略组合回测「最大回撤」严重虚高** —— 用户反馈：3 个策略各自最大回撤仅 45.53%/40.16%/16.89%，组合在一起却显示 **83.76%**。根因是 `MultiStrategyEngine._build_combined_equity` 计算 `drawdown_pct` 时**分母误用初始资金（`initial`）而非逐点峰值（`peak`）**：净值大涨后峰值是初始值的好几倍（本例总收益 545%，峰值≈6.45×初始），同样的绝对回撤额除以小的初始值，百分比被等比放大。正确公式应为 `drawdown / peak`（相对当时峰值的回撤，0~1），与单标的 `PortfolioTracker.equity_curve` 的 `drawdown_pct` 定义一致。修复后最大回撤回到合理区间（≤ 各策略最大回撤的加权，不可能超过 100%）。**连带修复**：卡玛比率（`年化收益 / 最大回撤`）此前因 max_drawdown 虚高而被压低，修复后恢复正常。其余指标（总收益/年化/夏普/索提诺/波动率/交易数/胜率/盈亏比）经逐一核对**均正确**，不受此 bug 影响。
+
+### 修复
+
+- **`drawdown_pct` 分母改用逐点峰值**（`src/easy_tdx/backtest/multi_strategy_engine.py` `_build_combined_equity`）—— `drawdown / initial` → `drawdown / peak`（`peak_safe = peak.where(peak != 0, 1.0)` 防除零）。这同时修复 `EquityChart` 回撤曲线显示（前端读 `drawdown_pct` 取负向下画）。
+- **回归守卫**（`tests/unit/test_multi_strategy.py::test_max_drawdown_relative_to_peak_not_initial`）—— 构造「净值 1→6→4」的大涨后回撤场景，断言 `max_drawdown ≈ 33%`（旧逻辑会算成 200%，必 >1，断言 `≤1.0` 抓住回归）。
+
+## [1.17.12] — 2026-07-04
+
+**修复 CI 在新版 FastAPI 上路由注册失败** —— v1.17.11 的 `DELETE /api/v1/strategies/{id}` 用 `status_code=204`，较新 FastAPI/Starlette 在路由注册阶段（`add_api_route`）就抛 `AssertionError: Status code 204 must not have a response body`，导致 CI 的 ubuntu 矩阵（py3.10/3.12/3.13）整片 ERROR（21 个 web 测试因 fixture 导入 router 而连带失败）。改为返回 `200 + {"deleted": id}` 确认体，既消除注册期断言又给前端明确反馈。
+
+### 修复
+
+- **DELETE 路由不再用 204**（`src/easy_tdx/web/routers/strategies.py`）—— `status_code=204` 改为默认 200，返回 `{"deleted": strategy_id}`；同步更新测试断言（`tests/unit/test_strategy_store.py`）。
+
+## [1.17.11] — 2026-07-04
+
+**Web UI 新增「策略库」与「多策略组合回测」** —— 此前回测结果存在进程内存，重启即丢，用户无法留存自己反复验证过的好策略。本次落地两层能力：(1) **策略库**——在单标的/组合回测结果区点「保存策略」，把策略 + 标的上下文 + 成绩快照（总收益/夏普/回撤/胜率）一起存进本地 SQLite 单文件（`~/.easy_tdx/strategies.db`），策略库页可载入回填、一键重跑、删除；(2) **多策略组合回测**——策略库勾选 N 个单标的策略，各拿 1/N 资金、各跑原标的（取最新行情），净值曲线按日期并集对齐求和，组合结果复用单标的的 19 项完整绩效指标（基于合并净值曲线 + 汇总成交用 `PerformanceAnalyzer` 算出），并展示各策略当前持仓。**895 单测全绿**（+24 新增），ruff format/check / mypy strict / 前端 vue-tsc 全通过。
+
+### 新增
+
+- **策略库后端**（`src/easy_tdx/web/strategy_store.py`、`routers/strategies.py`）—— SQLite 单文件 CRUD（加入/列出/查看/删除），落库路径随 `EASY_TDX_CONFIG_DIR` 环境变量走（与 `config.py` 同约定），线程安全（写操作串行锁 + `check_same_thread=False`）。5 个接口：`GET/POST /api/v1/strategies`、`GET/DELETE /strategies/{id}`。保存记录含 strategy + params + context（symbol 或 stocks + 日期 + 周期）+ trade_config + snapshot（成绩快照）+ tags + notes。
+- **策略库前端**（`web-ui/src/views/StrategiesView.vue` + 路由 `/strategies` + 导航）—— 卡片网格列表，展示策略名/标的/收益/夏普/回撤/标签/备注/创建时间。「载入」跳转对应回测页并自动回填（单标的剥掉市场前缀只传 6 位代码；组合新增 URL query 回填）；「删除」二次确认。空态提示去回测页保存。
+- **保存策略按钮**（`BacktestView.vue` / `PortfolioView.vue` 结果区）—— 弹窗填名称/标签/备注，其余（策略参数、标的上下文、成绩快照）自动从当前请求 + 结果填入。
+- **多策略组合回测引擎**（`src/easy_tdx/backtest/multi_strategy_engine.py`）—— `MultiStrategyEngine`：N 个策略各拿 1/N 资金、各跑原标的，曲线按日期并集 ffill 对齐求和。输出结构同 `PortfolioResult`（`individual_results` key 形如 `"双均线交叉@SH:601088"`），前端复用组合页图表零改动。
+- **多策略组合回测接口**（`web/routers/backtest.py` `POST /backtest/multi-strategy/run/async`）—— 勾选 N 个策略，逐个在 async 上下文取行情 + 构造策略实例（失败跳过），后台线程跑引擎。组合整体绩效基于合并净值曲线 + 汇总成交喂 `PerformanceAnalyzer`，得到与单标的同口径的 19 项指标。
+- **策略库组合回测 UI**（`StrategiesView.vue`）—— 每张卡片加复选框（组合策略无单一 symbol 自动 disabled），顶部「组合回测(N)」按钮，结果区复用 `EquityChart` + `MetricTable`（19 项绩效）+ `PortfolioSummaryTable` + `PortfolioCompareChart` + 当前持仓表（各策略回测结束持仓快照）。
+
+### 变更
+
+- **`PortfolioView.vue` 新增 URL query 回填** —— 此前组合页不读 query，策略库「载入组合策略」无法回填；新增 `onMounted` 读取 `strategy/params/stocks/startDate/endDate/category`，与单标的页回填风格一致。
+- **修正多策略合并净值曲线回撤符号** —— `_build_combined_equity` 原用 `drawdown = total - peak`（负值），改为 `peak - total`（正值），与单标的 `PortfolioTracker`、`PerformanceAnalyzer`、`EquityChart`（前端取负向下画）的正值约定一致；否则最大回撤算成 0、夏普/卡玛比率失真。
+
+### 已知约束（非 bug）
+
+- **多策略组合回测仅支持资金分仓（并行制）** —— 每个策略各拿 1/N 资金独立回测后曲线相加；不支持信号共振（投票制，`combo.py` 已有但未暴露 Web API）。资金/成本统一一组均分，不支持每策略单独配置。
+- **组合回测结果暂不回存策略库** —— 当前可保存的是单次回测的策略；多策略组合的结果暂未支持存为"策略的组合"。
+
+## [1.17.10] — 2026-07-04
+
+**Web UI 一键寻优「查看」按钮跳转携带完整行情上下文** —— `/optimize` 页策略排名表的两个「查看」按钮此前跳转只带 `strategy` + `params`，丢失了股票代码、周期、起止日期，导致跳到回测页后用户得手动重选标的与日期才能复现寻优行情。本次让跳转 URL 额外携带 `symbol/startDate/endDate/category`，回测页 `onMounted` 自动回填到 `SymbolPicker` 表单（股票代码/周期/起止日期全部就位），用户只需点「开始回测」即可完整复现。**向后兼容**：老书签（只有 `strategy/params`）仍正常工作，缺失字段保持默认值。前端 `vue-tsc --noEmit` / `vite build` 通过，后端 870 单测全绿（无回归）。
+
+### 新增
+
+- **SymbolPicker 表单状态双向同步**（`web-ui/src/components/SymbolPicker.vue`）—— `code/category/startDate/endDate` 从私有 `ref` 升级为 `defineModel`（带默认值），父组件可读（拼 URL）可写（回填表单）。`defineExpose({ loadBars, loading })` 保留不动，向后兼容已有调用。
+
+### 变更
+
+- **「查看」跳转 URL 携带完整上下文**（`web-ui/src/views/OptimizeView.vue`）—— 抽 `buildBacktestQuery(strategyName, params)` 统一构造 query，`onViewParams`（单策略网格排名表）/`onViewAll`（全局策略排名表）两个按钮跳转时附带 `symbol/startDate/endDate/category`。
+- **回测页回填标的与日期**（`web-ui/src/views/BacktestView.vue`）—— `onMounted` 新增读取 `route.query.symbol/startDate/endDate/category`，各字段独立 `if` 守卫回填到 `SymbolPicker` v-model 镜像 ref。老 URL 缺失字段保持默认值。
+
+### 已知约束（非 bug）
+
+- **URL query `category` 无白名单校验** —— 与既有 `strategy/params` 读取风格一致，非法值由后端 `/bars` 兜底拒绝；前端 `<select>` 显示为空但不崩溃。属项目既有输入校验风格，留作后续可选加固（应整体覆盖，避免不对称修补）。
+
+## [1.17.9] — 2026-07-04
+
+**修复 Web UI 回测「交易」统计面板离谱数值** —— 单标的回测页绩效指标右侧「交易」面板出现 `平均盈利 65409694.45%`、`最大盈利 133926612.60%`、`平均持仓天数 1173.792`、`盈亏比 0.000`（却胜率 100%）等明显异常值。根因是后端 `avg_win/avg_loss/max_win/max_loss` 返回**绝对盈亏额（元）**，前端 `MetricTable.vue` 却按**百分比小数 ×100** 显示；`_compute_avg_holding_days` 用 `YYYYMMDD` 整数相减代替真实日期相减（跨月放大，如 `20240201-20240131=70`）；`profit_factor` 在无亏损交易时被强制记为 `0.0`。真实数据复现用户场景（300580，RSI reversal n=14/超卖30/超买70/开盘价，2020-01-06~2026-07-03）验证修复：平均盈利 `65409694.45% → 26.85%`、最大盈利 `133926612.60% → 49.26%`、平均持仓 `1173.792 → 91.0 天`、盈亏比 `0.000 → 999.000`。**870 单测全绿**（+3 回归守卫），ruff format/check / mypy strict / 前端 vue-tsc 全通过。
+
+### 修复
+
+- **交易盈亏指标口径**（`src/easy_tdx/backtest/performance.py` `compute`）—— `avg_win/avg_loss/max_win/max_loss` 由「绝对盈亏额（元）」改为「单笔收益率（= pnl / cost_basis）」。新增 `cost_basis` 字段：`Trade` 增加该字段（`types.py`），`engine._compute_pnls` 在 SELL 时填入对应持仓的移动加权平均成本 × 卖出数量（`engine.py`），`_trades_to_df` 增加列。明细表 `TradeTable.vue` 的「盈亏」列仍按元显示，与汇总表的「平均盈利 %」各司其职。
+- **平均持仓天数跨月放大**（`src/easy_tdx/backtest/performance.py` `_compute_avg_holding_days`）—— 原用 `YYYYMMDD` 整数相减（如 `20240201-20240131=70`），跨月越多虚高越严重；改为解析为 `datetime.date` 后相减取真实日历日。无 `cost_basis` 列或日期无法解析时安全降级，不抛异常。
+- **盈亏比在无亏损交易时为 0**（`src/easy_tdx/backtest/performance.py`）—— 100% 胜率（无亏损交易）时 `profit_factor` 由 `0.0` 改为 `999.0`（与 `calmar` 在无回撤正收益时的约定一致），消除「胜率 100% 却盈亏比 0」的自相矛盾。
+- **object dtype 上 `np.isfinite` 崩溃**（`src/easy_tdx/backtest/performance.py`）—— 真实 engine 产出的 trades DataFrame 列可能为 int/object dtype，导致 `np.isfinite` 抛 `TypeError`；显式 `to_numpy(dtype=np.float64)` 转换。
+
+### 回归守卫
+
+- `tests/unit/test_backtest_performance.py::test_avg_holding_days_crosses_month_boundary` —— 跨月持仓必须用真实日历日（1 天），而非 YYYYMMDD 整数差（70）。
+- `tests/unit/test_backtest_performance.py::test_profit_factor_no_losing_trades_is_large` —— 全盈利无亏损时 `profit_factor == 999.0`。
+- `tests/unit/test_backtest_performance.py::test_avg_win_zero_when_no_cost_basis_column` —— trades 缺 `cost_basis` 列时 `avg_win/max_win` 安全降级为 0.0，不抛 KeyError。
+
+## [1.17.8] — 2026-07-04
+
+**修复 Windows CI 矩阵 flaky 测试** —— `test_task_runner_does_not_evict_running` 用 `release.wait(timeout=5)` 钉住慢任务保持 running，但 CI 慢环境（windows 3.10）下整个测试执行超过 5s 后任务因超时自动完成、状态变 `done`，掩盖了「running 任务被 LRU 错误淘汰」的回归断言。改为 `timeout=30` 留足 CI 慢环境余量（`release.set()` 仍是确定性释放点）。**867 单测全绿**（本地连跑 5 次稳定通过），Windows 全矩阵转绿。
+
+### 修复
+
+- **flaky 时序测试超时**（`tests/unit/test_web_backtest.py::test_task_runner_does_not_evict_running`）—— `slow_task` 的 `release.wait(timeout=5)` 在 CI 慢环境下不够整个测试跑完，改为 `timeout=30`。该测试用于守护「LRU 淘汰跳过 running 任务」的并发正确性回归（审计修复），与港股逐笔成交无关，是 v1.17.2 引入的预先存在问题。
+
+## [1.17.7] — 2026-07-04
+
+**修复 Windows CI：fixture 文件读取编码** —— 1.17.5 引入的 `tests/fixtures/ex_history_transaction.json` 含中文注释，Windows CI 默认用 cp1252 解码 UTF-8 文件触发 `UnicodeDecodeError: 'charmap' codec can't decode byte 0x8f`，导致 3 个 Windows 矩阵（3.10/3.12/3.13）的 `test_parse_ex_history_transaction_hk` 失败。统一为 fixture 读取显式指定 `encoding="utf-8"`。**867 单测全绿**，ruff format/check / mypy strict 通过，Windows + Linux 矩阵均转绿。
+
+### 修复
+
+- **Windows fixture 读取编码**（`tests/unit/test_hk_transaction.py` `load_hex`/`load_json`、`tests/unit/test_commands_offline.py` `load_hex`、`tests/unit/test_decode_errors.py` `_load_hex`）—— 所有 fixture 文件读取显式指定 `encoding="utf-8"`，避免 Windows 默认 cp1252 编码读取含中文 fixture 时 `UnicodeDecodeError`。`test_commands_offline` 与 `test_decode_errors` 的 hex 文件虽为纯 ASCII 当前未触发，但一并修复以统一编码规范、防范未来回归。
+
+## [1.17.6] — 2026-07-04
+
+**港股逐笔成交：补充 start 倒序语义文档 + 新增 goods_transaction_all 全量取数** —— 回应 issue #14 后用户反馈：默认 `count=2000` 取回的成交记录时间全集中在尾盘（如 02715 全天成交 13327 笔，count=2000 只取到最近 2000 笔）。根因是通达信逐笔协议（A 股 0x122F 与港股 ex 0x23FC/0x2406 一致）的 `start` 为**倒序**语义——start=0 指向最新一笔（收盘方向），并非 bug。本次：补 docstring 说明 start 语义；新增 `goods_transaction_all` 自动翻页取全天全部成交。**867 单测全绿**（+5），ruff format/check / mypy strict 通过。
+
+### 新增
+
+- **`goods_transaction_all`（全量取数）**（`src/easy_tdx/ex/mac_client.py` 同步 + 异步、`src/easy_tdx/ex/_hk_transaction.py` 新增 `_fetch_all_hk_transactions_sync/async`）—— 港股股票类市场专用，自动按 1800/页翻页直至末页（不足一页或空即停），返回当日全部逐笔成交（港股单日常 1~5 万笔）。安全上限 50 页（90000 条）防止异常数据导致无限翻页。返回顺序为协议原生倒序（最新在前）；需正序展示由调用方自行 `df.iloc[::-1]`。market 非港股股票类时抛 `ValueError`。
+
+### 变更
+
+- **`goods_transaction` docstring 补 start 倒序语义**（`src/easy_tdx/ex/mac_client.py`）—— 明确说明 `start=0` 指向最新一笔（收盘方向），与 A 股 0x122F 语义一致；提示 `count=2000` 默认只取最近 2000 笔会集中在尾盘，需全天数据请用 `goods_transaction_all`。
+
+### 修复
+
+- **CI ruff format 失败**（`tests/unit/test_hk_transaction.py`）—— 1.17.5 引入的测试文件未过 `ruff format --check`（参数化注释前双空格、MacTransaction 单行化、文末空行）。本次顺手修复。
+
+## [1.17.5] — 2026-07-04
+
+**港股逐笔成交协议路由修复** —— 修复 issue #14：`MacExClient.goods_transaction` 对港股市场（HK 主板 / 创业板 / 指数 / 基金 / 港股通 / 暗盘）返回空。根因是对所有扩展市场统一复用了 A 股 MAC 协议的 `SymbolTransactionCmd`（0x122F），而 0x122F 的数据源未接入港股，服务器对港股 market 一律返回 39 字节空响应（count=0）。改为对港股股票类市场路由到 ex 扩展行情协议（当日 0x23FC / 历史 0x2406），并把整数价格换算为港元浮点。**860 单测全绿**（+22），ruff / mypy strict 通过。
+
+### 修复
+
+- **港股逐笔成交协议路由**（`src/easy_tdx/ex/mac_client.py` 同步 + 异步 `goods_transaction`、新增 `src/easy_tdx/ex/_hk_transaction.py`）—— 港股股票类市场（`HK_STOCK_MARKETS = {27, 31, 48, 49, 71, 98}`，即 HK_INDEX/HK_MAIN_BOARD/HK_GEM/HK_FUND/HK_STOCK_GGT/HK_DARK_POOL）改走 ex 扩展行情协议：`query_date=None` → `GetExTransactionDataCmd`（0x23FC 当日），指定日期 → `GetExHistoryTransactionDataCmd`（0x2406 历史）。返回的 `ExTransactionRecord`（price 为整数、单位 0.001 HKD）映射为与 A 股 `MacTransaction` 一致的 schema（`time/price/vol/trade_count/bs_flag`），价格 ÷1000 换算为港元浮点，与港股分时图 float 价格对齐。count > 1800 时按 1800/页自动分页。其余扩展市场（美股 / 期货等）保持 MAC 0x122F 路径不变。
+- **回归测试**（`tests/unit/test_hk_transaction.py`，新建 +22 例；`tests/fixtures/ex_history_transaction.hex` + `.json`，录制自真实港股 00700 在 2026-07-03 的 0x2406 响应）—— 覆盖：ex 历史 0x2406 响应解析、空响应处理、`ExTransactionRecord → MacTransaction` 字段映射 + 价格换算、`is_hk_stock_market` 市场判定边界（11 个参数化用例）、mock `_execute` 验证路由（港股走 ex / 期货仍走 0x122F）、分页与空停止逻辑。
+
+### 说明
+
+- issue #14 反馈的 `df1`（7/4 周六休市）与 `df2`（7/1 香港回归纪念日休市）返回空属正常休市；真正的 bug 是 `df3`（7/3 开市日 02715，`HK_MAIN_BOARD`）。修复后开市日港股逐笔成交可正常取数。
+- 港股衍生品（HK_FINANCIAL_FUTURES=23 / HK_STOCK_OPTIONS=26 等）不在本次路由范围：期货/期权逐笔语义不同，且 0x122F 对 CFFEX 期货恰好可用，保持现状避免回归。
+
+## [1.17.4] — 2026-07-04
+
+**Web UI 回测交互重构 + 一键寻优全策略** —— 针对单标的 / 组合 / 寻优四个页面做交互精简与能力补强：取行情整合进「开始回测」一键完成、市场选择改为 6 位代码智能识别、成交价精简为开盘价/收盘价、初始资金统一为 100 万、新增 18 策略预设参数网格与「一键寻优所有策略」全局排名。**838 单测全绿**（+2），ruff / mypy strict / vue-tsc 全部通过。
+
+### 新增
+
+- **一键寻优所有策略**（`web/routers/backtest.py`）—— 新增第 7 个回测端点 `POST /backtest/optimize-all/run/async`：对全部 18 个内置策略逐个用其预设参数网格做 `ParamGridOptimizer` 网格寻优（共用同一份 OHLCV），取各策略最优点汇总成全局排名（按总收益降序），返回 `OptimizeAllResult`（`ranking` / `best` / `per_strategy` / `total_grid_points`）。前端寻优页新增「一键寻优所有策略」按钮 + 策略排名表（策略/参数/收益/夏普/回撤/胜率），点击行可跳转单标的页用该策略+参数回测。端到端实测：18 策略 × 182 网格点约 5s 跑完。
+- **策略预设参数网格**（`backtest/strategies/presets.py`，新建独立配置文件）—— 18 个策略各配 1-2 个关键参数的合理取值列表（单策略笛卡尔积 ≤ 200），如双均线 `fast=[5,10,15,20,30,60] × slow=[10,20,30,60,120,250]`（36 点）、MACD `short=[8,10,12,15] × long=[20,26,30,40]`（16 点）等。作为单一事实源供寻优页自动填充 + 一键寻优消费；`RegisteredStrategy.to_schema()` 通过 `preset_grid` 字段返回，前端 `ParamGridPicker` 切换策略时自动勾选并填入预设（用户仍可编辑/取消）。
+- **市场智能识别**（`web-ui/src/market.ts`，新建）—— `detectMarket(code)` 按 6 位代码段规则自动匹配沪市(SH)/深市(SZ)/北交所(BJ)：北交所 43/83/87/92(含920)/93 + 4xx/8xx，沪市 6xx(主板/科创板)/9xx(B股)/5xx(基金)，其余归深市。17 个真实边界用例（贵州茅台/宁德时代/北交所各段/ETF 等）全过。
+- **一键寻优端到端单测**（`tests/unit/test_web_backtest.py`，+2 例）—— `test_optimize_all_endpoint` 验证排名降序、best 指向第一、各策略最优点齐全、合计网格点 = 各策略 grid_points 之和；`test_optimize_all_request_validation` 验证缺数据源报错 + 默认值。
+
+### 变更
+
+- **取行情整合进「开始回测」**（`web-ui/src/components/SymbolPicker.vue`、`views/BacktestView.vue`、`views/OptimizeView.vue`）—— 取消单标的/寻优页独立的「取行情」按钮，点击「开始回测/开始寻优」时先自动取行情（`SymbolPicker` 经 `defineExpose` 暴露 `loadBars()`）再回测，按钮文案随状态切换为「取行情+回测中…」。组合页本就是后端取数路径，无需改动。
+- **取消市场手动选择**（`web-ui/src/components/SymbolPicker.vue`、`StocksPicker.vue`）—— 删除沪市/深市/北交所下拉框，只保留 6 位代码输入，由 `detectMarket` 自动识别并显示（代码框旁小标签 / 添加时提示）。后端校验仍要求 `市场:代码` 格式，前端始终发送带前缀 symbol。
+- **成交价精简为开盘价 / 收盘价**（`backtest/orders.py`、`backtest_schemas.py`、`types.ts`）—— 删除 `this_close`（本根收盘，有未来函数偏差会高估收益）、`worst`（最差价）、`best`（最优价）三种非真实成交模式，只保留 `next_open`（次日开盘价）与 `next_close`（次日收盘价）两种真实可执行模式。UI 下拉显示中文「开盘价/收盘价」。后端字符串值不变以保持数据契约。
+- **初始资金统一为 1,000,000**（前端三个 view + `backtest_schemas.py` 三处 default）—— 单标的/组合/寻优默认初始资金从 10 万/20 万统一为 100 万。
+- **寻优预设自动填充**（`web-ui/src/components/ParamGridPicker.vue`）—— 切换策略时若有 `preset_grid` 自动勾选对应参数并填入预设取值，提示文案补充「切换策略会自动填入预设参数，可直接编辑」。
+
+### 修复
+
+- **一键寻优合计网格点计算错误**（`web/routers/backtest.py` `_run_optimize_all`）—— 初版用各参数取值列表长度之和（如双均线算成 6+6=12）而非笛卡尔积（应为 6×6=36），导致前端「合计 N 网格点」显示偏低。改为累加各策略 `len(result.results)`（真实成功网格点），现等于理论笛卡尔积之和。
+
+## [1.17.2] — 2026-07-03
+
+**QFQ 深层历史负价修复** —— 修复通达信服务端在前复权（QFQ）模式下对长期重度除权股票（如 601088 中远海控）深层历史页直接返回**负价格**的上游缺陷，导致回测出现总收益 -3087%、最大回撤 326.85%、年化 nan%、`bollinger_breakout` 崩溃（`ZeroDivisionError`）、10 个策略报 `invalid value in scalar power`、`MyTT` 报 `divide by zero` 等一连串症状。**844 单测全绿**（+20），ruff / mypy strict 通过。
+
+### 修复
+
+- **QFQ 深层历史返回负价**（`mac/commands/symbol_bar.py`、`mac/client.py`、`mac/adjust.py`）— 根因：通达信 MAC 服务端在 QFQ 模式下，对 601088 这类长期重度除权股票的深层历史页（`start` 偏移 > ~2100）直接返回负价格（如 2013-11-18 QFQ close=-3.80，而 NONE=16.58、HFQ=27.17 均正常）。`SymbolBarCmd` 原样解析，污染下游全部计算：负 close → `position_value = size*close < 0` → 总权益为负 → 回撤 >100%、`total_return < -1` → `(1+total_return)` 为负 → 分数次幂 = nan；同时 BOLL 指标在零价处触发 `cash/0` 崩溃。**非 easy_tdx 代码 bug，是上游数据缺陷。**
+  - 修复：客户端兜底——`MacClient.get_stock_kline` 检测到 QFQ 结果含 `<=0` / NaN / inf 时，用 `fq=NONE` 重抓原始价，再经 `TdxClient.get_xdxr_info`（连 `get_known_hosts` 主机池，按 `(market,code)` 缓存）拉除权除息记录，本地重算前复权。同步 + 异步（`AsyncMacClient`）双路径一致修复。
+  - 公式（经实证验证）：以**除权日前一交易日收盘价**（含权价 `P_cum`）为基准，前复权因子 `f = (P_cum - fenhong + peigujia×peigu) / (P_cum×(1+songzhuangu+peigu))`，乘到该日及之前所有 bar 的 OHLC。该约定保证除权日前后价格连续（验证 jump≈0%），若误用除权日收盘价则 jump 达 -8%~-13%。
+  - 降级：XDXR 取不到或重算后仍含非法价格时，打 warning 返回原值（不比现状更坏）。
+  - 验证：重跑 `run_all_strategies.py SH 601088 --count 3000 --adjust QFQ`，16 策略全绿，总收益落 [-33%, +430%]，最大回撤 [25%, 67%]，年化全有限，无任何 warning/nan/崩溃。
+  - 新增纯函数模块 `mac/adjust.py`（`compute_forward_factor` / `apply_forward_adjust` / `has_bad_prices`），无网络依赖便于单测。
+
+### 新增
+
+- **QFQ 本地重算纯函数**（`mac/adjust.py`）— `compute_forward_factor`（单次除权因子）、`apply_forward_adjust`（OHLC 同比缩放，最新价锚定不动，多次事件累乘）、`has_bad_prices`（检测 <=0/NaN/inf）。纯 pandas/numpy，无 easy_tdx 内部依赖。
+- **QFQ 重算单测**（`tests/unit/test_mac_qfq_adjust.py`，16 例）— 覆盖纯现金分红、送转股、多次事件累乘、无事件原样返回、非法因子跳过、输入不可变、最新价锚定、`has_bad_prices` 各分支。
+- **QFQ 重算集成测试**（`tests/unit/test_mac_qfq_integration.py`，4 例）— monkeypatch `MacClient._execute` 返回含负价的 QFQ + mock `TdxClient.get_xdxr_info` 返回 XDXR，验证触发重算、干净 QFQ 不触发、XDXR 失败降级、NONE 跳过重算。无 live server。
+
 ## [1.17.0] — 2026-07-03
 
 **回测可视化 Web UI 大版本** —— 从命令行回测升级到浏览器可视化。Vue3 + ECharts 单页应用，零代码完成单标的回测、组合回测、参数寻优、结果对比四大场景。后端新增回测 REST API + 策略注册表 + 后台任务执行器，内置策略从 5 个扩充到 18 个。**823 单测全绿**，ruff / mypy strict / vue-tsc 全部通过。

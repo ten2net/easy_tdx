@@ -72,8 +72,17 @@ class TestConfigReadWrite:
         assert cfg.get_known_hosts() == list(cfg._FALLBACK_HOSTS)
 
     def test_config_json_host(self, isolated_config: Path) -> None:
+        # best_host 必须在 known_hosts 里才能通过污染校验（v1.19.4 新增）。
+        # 用 known_hosts 里的一个 host，确保不被重置。
         (isolated_config / "config.json").write_text(
-            json.dumps({"best_host": "203.0.0.1", "port": 7709, "timeout": 12.0}),
+            json.dumps(
+                {
+                    "best_host": "203.0.0.1",
+                    "known_hosts": ["203.0.0.1"],
+                    "port": 7709,
+                    "timeout": 12.0,
+                }
+            ),
             "utf-8",
         )
         assert cfg.get_best_host() == "203.0.0.1"
@@ -126,3 +135,67 @@ class TestSaveBestHost:
         cfg.save_best_host("x.host")
         assert not (isolated_config / "config.json.tmp").exists()
         assert (isolated_config / "config.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# best_host 交叉污染校验（v1.19.4 回归守卫）
+# --------------------------------------------------------------------------- #
+
+
+class TestBestHostPollutionGuard:
+    """MacClient.from_best_host 曾误调 save_best_host 把 MAC 服务器写入
+    best_host，导致标准 TdxClient 用错协议请求 MAC 服务器返回空 body。
+    get_best_host 现在含校验：缓存 host 不在标准列表里时自动重置。
+    """
+
+    def test_mac_host_in_best_host_gets_reset(
+        self, isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """best_host 被污染成 MAC host（不在标准列表）→ 自动重置。"""
+        polluted = {
+            "best_host": "121.36.248.138",  # MAC host
+            "known_hosts": ["180.153.18.170", "115.238.56.198"],
+        }
+        (isolated_config / "config.json").write_text(json.dumps(polluted), "utf-8")
+        monkeypatch.delenv("EASY_TDX_HOST", raising=False)
+
+        result = cfg.get_best_host()
+        assert result != "121.36.248.138", "MAC host 应被重置"
+        assert result in polluted["known_hosts"] or result in cfg._FALLBACK_HOSTS
+
+    def test_valid_host_not_reset(
+        self, isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """best_host 是合法标准 host → 不重置。"""
+        (isolated_config / "config.json").write_text(
+            json.dumps({"best_host": "180.153.18.170", "known_hosts": ["180.153.18.170"]}),
+            "utf-8",
+        )
+        monkeypatch.delenv("EASY_TDX_HOST", raising=False)
+        assert cfg.get_best_host() == "180.153.18.170"
+
+    def test_reset_persists_to_config(self, isolated_config: Path) -> None:
+        """重置后的 host 应写回 config.json，下次读不需再校验。"""
+        (isolated_config / "config.json").write_text(
+            json.dumps({"best_host": "121.36.248.138"}), "utf-8"
+        )
+        cfg.get_best_host()  # 触发重置
+        data = json.loads((isolated_config / "config.json").read_text("utf-8"))
+        assert data["best_host"] != "121.36.248.138"
+
+
+class TestMacHostSeparation:
+    """MAC 协议的 best host 应独立于标准 TDX 的 best_host。"""
+
+    def test_save_best_mac_host_does_not_touch_best_host(self, isolated_config: Path) -> None:
+        """save_best_mac_host 不应修改 best_host 字段。"""
+        cfg.save_best_host("180.153.18.170")
+        cfg.save_best_mac_host("121.36.248.138")
+        data = json.loads((isolated_config / "config.json").read_text("utf-8"))
+        assert data["best_host"] == "180.153.18.170"
+        assert data["best_mac_host"] == "121.36.248.138"
+
+    def test_get_best_mac_host_returns_mac_host(self, isolated_config: Path) -> None:
+        """get_best_mac_host 返回的是 MAC host 字段，不是标准 host。"""
+        cfg.save_best_mac_host("123.60.47.136")
+        assert cfg.get_best_mac_host() == "123.60.47.136"

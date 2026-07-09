@@ -185,17 +185,6 @@ def test_chanlun_injection():
     assert len(result.trades) >= 1
 
 
-def test_this_close_warning_in_config():
-    """Test future_leak_warning in config when using this_close."""
-    df = _make_df(n=50)
-    engine = BacktestEngine(MACrossStrategy, execution="this_close")
-    result = engine.run(df)
-
-    # Config should have future_leak_warning
-    # Note: MACrossStrategy may not generate signals, so warning might be False
-    assert "future_leak_warning" in result.config
-
-
 def test_config_snapshot():
     """Test config contains correct cash and commission."""
     df = _make_df(n=50)

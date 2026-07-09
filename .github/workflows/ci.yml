@@ -22,6 +22,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # 前端 dist 被 pyproject.toml 的 force-include 引用，pip install -e .
+      # 要求它存在。先构建前端（type-check + vite build）。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
+        working-directory: web-ui
+      - run: npm run build
+        working-directory: web-ui
       - run: pip install -e ".[dev]"
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests/unit/ -v --tb=short --cov src/easy_tdx --cov-fail-under=60
@@ -35,5 +46,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      # 同 test job：force-include 要求 web-ui/dist 存在。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
+        working-directory: web-ui
+      - run: npm run build
+        working-directory: web-ui
       - run: pip install -e ".[dev,web]"
       - run: mypy src/
+
+  # 前端构建检查。web-ui 此前只有本地 vue-tsc，CI 不覆盖，
+  # 类型错误 / 破坏性 import 只有发布后用户才发觉（v1.17.9 的
+  # 65409694% 离谱数值 bug 即前端无回归守卫的典型后果）。
+  # 与 Python 版本无关，故独立 job，避免在 test matrix 里跑 6 遍。
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
+        working-directory: web-ui
+      - run: npm run build
+        working-directory: web-ui

@@ -1,26 +1,35 @@
 <script setup lang="ts">
 // 组合回测主页面：左配置（多标的 + 策略 + 日期）/ 右报告（组合净值 + 各标的对比）。
 
-import { onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 
 import EquityChart from '../components/EquityChart.vue'
+import GradeDetails from '../components/GradeDetails.vue'
 import PortfolioCompareChart from '../components/PortfolioCompareChart.vue'
 import PortfolioSummaryTable from '../components/PortfolioSummaryTable.vue'
 import StocksPicker from '../components/StocksPicker.vue'
 import StrategyPicker from '../components/StrategyPicker.vue'
+import { formatError, saveStrategy } from '../api'
+import { gradePortfolio } from '../grading'
 import type { Category, ExecutionMode } from '../types'
 import { useBacktestStore } from '../stores/backtest'
 
 const store = useBacktestStore()
+const route = useRoute()
 
 const stocks = ref<string[]>(['SZ:000001', 'SH:600519'])
 const strategy = ref('ma_cross')
 const params = ref<Record<string, number | string | boolean>>({})
-const cash = ref(200000)
+const cash = ref(1000000)
 const category = ref<Category>('DAY')
 const execution = ref<ExecutionMode>('next_open')
 
-const EXECUTIONS: ExecutionMode[] = ['next_open', 'next_close', 'this_close', 'worst', 'best']
+// 成交价模式（精简为 开盘价/收盘价）
+const EXECUTIONS: { value: ExecutionMode; label: string }[] = [
+  { value: 'next_open', label: '开盘价' },
+  { value: 'next_close', label: '收盘价' },
+]
 const CATEGORIES: Category[] = ['DAY', 'WEEK', 'MONTH', 'MIN_5', 'MIN_15', 'MIN_30', 'MIN_60']
 
 // 日期默认（复用单标的逻辑）
@@ -29,13 +38,41 @@ function isoDaysFromNow(days: number): string {
   d.setDate(d.getDate() + days)
   return d.toISOString().slice(0, 10)
 }
-const startDate = ref(isoDaysFromNow(-365 * 3))
+const startDate = ref('2020-01-06')
 const endDate = ref(isoDaysFromNow(0))
 
-onMounted(() => {
+onMounted(async () => {
   store.loadStrategies().catch((e) => {
     store.error = `加载策略列表失败：${e instanceof Error ? e.message : e}`
   })
+
+  // 从 URL query 回填（策略库「载入」组合策略跳转带来）
+  const qStrategy = route.query.strategy as string | undefined
+  const qParams = route.query.params as string | undefined
+  const qStocks = route.query.stocks as string | undefined
+  const qStartDate = route.query.startDate as string | undefined
+  const qEndDate = route.query.endDate as string | undefined
+  const qCategory = route.query.category as Category | undefined
+  if (qStrategy) {
+    strategy.value = qStrategy
+    await nextTick()
+  }
+  if (qParams) {
+    try {
+      params.value = JSON.parse(qParams) as Record<string, number | string | boolean>
+    } catch {
+      // 解析失败忽略
+    }
+  }
+  if (qStocks) {
+    stocks.value = qStocks
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  }
+  if (qStartDate) startDate.value = qStartDate
+  if (qEndDate) endDate.value = qEndDate
+  if (qCategory) category.value = qCategory
 })
 
 async function onRun() {
@@ -49,6 +86,74 @@ async function onRun() {
     start_date: startDate.value,
     end_date: endDate.value,
   })
+}
+
+// ── 保存策略（把当前组合结果 + 配置 + 上下文存进策略库）──────────────────────
+const showSaveForm = ref(false)
+const saving = ref(false)
+const saveName = ref('')
+const saveTags = ref('')
+const saveNotes = ref('')
+const saveMsg = ref('')
+
+const strategyLabel = computed(
+  () => store.strategies.find((s) => s.name === strategy.value)?.label ?? strategy.value,
+)
+
+// 组合评级：从 combined_equity 重算夏普/卡玛/波动率等（组合级净值算不出胜率/利润因子），
+// 用 5 维度评分。净值点数过少（< 60 个交易日）视为样本不足。
+const grade = computed(() =>
+  store.portfolioResult ? gradePortfolio(store.portfolioResult) : null,
+)
+
+function openSaveForm() {
+  saveName.value = `${strategyLabel.value} · 组合${stocks.value.length}只`
+  saveTags.value = ''
+  saveNotes.value = ''
+  saveMsg.value = ''
+  showSaveForm.value = true
+}
+
+async function onSave() {
+  if (!store.portfolioResult || !saveName.value.trim()) return
+  saving.value = true
+  saveMsg.value = ''
+  try {
+    const perf = store.portfolioResult.total_performance
+    await saveStrategy({
+      name: saveName.value.trim(),
+      kind: 'portfolio',
+      strategy: strategy.value,
+      strategy_label: strategyLabel.value,
+      params: params.value,
+      context: {
+        stocks: stocks.value,
+        category: category.value,
+        start_date: startDate.value,
+        end_date: endDate.value,
+      },
+      trade_config: {
+        cash: cash.value,
+        execution: execution.value,
+      },
+      snapshot: {
+        total_return: perf.total_return,
+        annual_return: perf.annual_return,
+        total_stocks: perf.total_stocks,
+      },
+      tags: saveTags.value
+        .split(/[,，]/)
+        .map((t) => t.trim())
+        .filter(Boolean),
+      notes: saveNotes.value,
+    })
+    saveMsg.value = '✓ 已保存到策略库'
+    showSaveForm.value = false
+  } catch (e) {
+    saveMsg.value = `保存失败：${formatError(e)}`
+  } finally {
+    saving.value = false
+  }
 }
 </script>
 
@@ -98,9 +203,9 @@ async function onRun() {
           <input v-model.number="cash" type="number" min="1000" step="10000" />
         </div>
         <div class="field">
-          <label>成交模式</label>
+          <label>成交价</label>
           <select v-model="execution">
-            <option v-for="e in EXECUTIONS" :key="e" :value="e">{{ e }}</option>
+            <option v-for="e in EXECUTIONS" :key="e.value" :value="e.value">{{ e.label }}</option>
           </select>
         </div>
       </section>
@@ -125,6 +230,16 @@ async function onRun() {
       </div>
 
       <div v-if="store.portfolioResult" class="report-content">
+        <div class="result-toolbar">
+          <button class="ghost" @click="openSaveForm">💾 保存策略</button>
+          <span v-if="saveMsg" class="save-msg">{{ saveMsg }}</span>
+        </div>
+
+        <section v-if="grade" class="report-section">
+          <h3>组合评级</h3>
+          <GradeDetails :result="grade" expanded />
+        </section>
+
         <section class="report-section">
           <h3>组合整体绩效</h3>
           <div class="perf-summary">
@@ -167,6 +282,42 @@ async function onRun() {
         </section>
       </div>
     </main>
+
+    <!-- 保存策略对话框 -->
+    <div v-if="showSaveForm" class="modal-overlay" @click.self="showSaveForm = false">
+      <div class="modal">
+        <h3>保存到策略库</h3>
+        <p class="modal-desc">
+          将当前组合策略 + 标的列表 + 成绩快照存下，下次可在「策略库」载入或重跑。
+        </p>
+        <div class="field">
+          <label>名称</label>
+          <input v-model="saveName" type="text" placeholder="给这个组合策略起个名" />
+        </div>
+        <div class="field">
+          <label>标签（逗号分隔，可选）</label>
+          <input v-model="saveTags" type="text" placeholder="如：消费,长线观察" />
+        </div>
+        <div class="field">
+          <label>备注（可选）</label>
+          <textarea v-model="saveNotes" rows="2" placeholder="为什么觉得它好？"></textarea>
+        </div>
+        <div class="modal-summary">
+          {{ strategyLabel }} · {{ stocks.length }} 只 ·
+          {{
+            store.portfolioResult
+              ? (store.portfolioResult.total_performance.total_return * 100).toFixed(2) + '%'
+              : ''
+          }}
+        </div>
+        <div class="modal-actions">
+          <button class="ghost" :disabled="saving" @click="showSaveForm = false">取消</button>
+          <button class="primary" :disabled="saving || !saveName.trim()" @click="onSave">
+            {{ saving ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -262,5 +413,112 @@ async function onRun() {
 }
 .neg {
   color: var(--down);
+}
+
+/* 结果工具条 + 保存对话框 */
+.result-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.result-toolbar .ghost {
+  font-size: 12px;
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.result-toolbar .ghost:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.save-msg {
+  font-size: 12px;
+  color: var(--up);
+}
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  width: 380px;
+  max-width: 90vw;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.modal h3 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.modal-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.modal .field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.modal .field label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.modal .field input,
+.modal .field textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 7px 9px;
+  font-size: 13px;
+  color: var(--text);
+  font-family: inherit;
+  resize: vertical;
+}
+.modal-summary {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  padding: 8px 10px;
+  background: var(--bg);
+  border-radius: var(--radius);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.modal-actions .ghost {
+  font-size: 13px;
+  padding: 7px 16px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.modal-actions .primary {
+  font-size: 13px;
+  padding: 7px 16px;
+  cursor: pointer;
+}
+.modal-actions .primary:disabled,
+.modal-actions .ghost:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 </style>

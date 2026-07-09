@@ -9,13 +9,20 @@
 逐字节重复（仅心跳命令和 logger 名不同）。这里抽出
 ``AsyncHeartbeatMixin`` 收敛这些副本——子类只需实现 ``_heartbeat_cmd()``
 返回一个 awaitable 即可，未来改心跳策略只需改一处。
+
+跨主机故障转移（failover）：8 个 client 的 ``_execute`` 在同主机重试耗尽
+（``_RETRY_DELAYS`` 走完仍 ``TdxConnectionError``）后，调用本模块的
+``select_best_host_sync`` / ``select_best_host_async`` 重新测速、切到延迟
+最低的**另一台**服务器再试一轮。这样服务器连不上时无需用户手动 ``ping``，
+Python API / CLI / Web API 三入口自动生效（三者最终都汇聚到 ``_execute``）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable
+import time
+from collections.abc import Awaitable, Callable
 
 from .exceptions import TdxConnectionError, TdxDecodeError
 
@@ -32,6 +39,217 @@ _HEARTBEAT_RETRYABLE: tuple[type[BaseException], ...] = (
     TdxConnectionError,
     TdxDecodeError,
 )
+
+# --------------------------------------------------------------------------- #
+# 跨主机故障转移（failover）共享实现
+# --------------------------------------------------------------------------- #
+#
+# 设计要点：
+# 1. 纯函数，不依赖任何 client 状态——8 个 client 各自传入自己的
+#    (候选主机列表, 测速函数, 持久化函数, 端口)。便于单测、避免循环依赖。
+# 2. 只返回与 current_host *不同* 的最优主机；若所有候选都不可达或唯一可达
+#    的就是 current_host，返回 None（调用方保持原 host 不变）。
+# 3. 进程级节流：_FAILOVER_PING_THROTTLE_SEC 秒内不重复全量测速——一次失败
+#    可能触发多个并发请求同时进入 failover，节流避免对几十台服务器发起
+#    "惊群"式测速。节流窗口内直接返回 None（放弃本次跨主机切换，让外层
+#    同主机重试兜底）。
+
+# 同一进程内两次全量测速的最小间隔（秒）。
+_FAILOVER_PING_THROTTLE_SEC: float = 30.0
+
+# 上次全量测速完成的时间戳（monotonic）；初始 0 表示"从未测过"。
+_last_failover_ts: float = 0.0
+
+
+def _throttled() -> bool:
+    """距上次全量测速是否仍在节流窗口内（True=应跳过本次测速）。"""
+    global _last_failover_ts
+    return (time.monotonic() - _last_failover_ts) < _FAILOVER_PING_THROTTLE_SEC
+
+
+def _mark_failover_done() -> None:
+    """记录"本次全量测速已完成"，开启新一轮节流窗口。"""
+    global _last_failover_ts
+    _last_failover_ts = time.monotonic()
+
+
+# 测速函数的统一签名：(hosts, port, timeout) -> [(host, latency_seconds), ...]
+PingFn = Callable[..., list[tuple[str, float]]]
+# 持久化函数的统一签名：(host) -> None
+SaveFn = Callable[[str], None]
+
+
+def select_best_host_sync(
+    hosts: list[str],
+    ping_fn: PingFn,
+    save_fn: SaveFn,
+    port: int,
+    ping_timeout: float,
+    current_host: str,
+) -> str | None:
+    """重新测速并选出优于当前主机的最佳主机（同步）。
+
+    Args:
+        hosts: 候选主机列表（如 ``get_known_hosts()``）。
+        ping_fn: 测速函数（``ping_all`` / ``ping_mac_all`` / ``ping_ex_all``），
+            签名 ``(hosts, port, timeout) -> [(host, latency), ...]``，已按
+            延迟升序返回，不可达主机不在结果中。
+        save_fn: 持久化函数（``save_best_host`` / ``save_best_ex_host`` /
+            ``save_best_mac_ex_host``），将选中的主机写回 config.json。
+        port: 目标端口。
+        ping_timeout: 单台测速超时（秒）。
+        current_host: 当前正在使用（且已判定不可用）的主机，结果会跳过它。
+
+    Returns:
+        选中的新主机（已 ``save_fn`` 持久化）；若无更优选择或处于节流窗口
+        内，返回 ``None``（调用方保持原 host）。
+    """
+    if _throttled():
+        logging.getLogger(__name__).debug(
+            "跨主机故障转移：处于 %ss 节流窗口内，跳过本次测速",
+            _FAILOVER_PING_THROTTLE_SEC,
+        )
+        return None
+    try:
+        ranked = ping_fn(hosts, port, ping_timeout)
+    finally:
+        # 无论测速是否拿到结果，都视为"完成一次测速"，开启节流窗口，
+        # 避免失败时被高频重试反复触发。
+        _mark_failover_done()
+    # 跳过当前（已判定不可用）主机，取延迟最低的另一台
+    for host, _latency in ranked:
+        if host != current_host:
+            save_fn(host)
+            logging.getLogger(__name__).info("跨主机故障转移：从 %s 切换到 %s", current_host, host)
+            return host
+    return None
+
+
+async def select_best_host_async(
+    hosts: list[str],
+    ping_fn: PingFn,
+    save_fn: SaveFn,
+    port: int,
+    ping_timeout: float,
+    current_host: str,
+) -> str | None:
+    """重新测速并选出优于当前主机的最佳主机（异步）。
+
+    与 :func:`select_best_host_sync` 语义一致；测速在线程池中执行
+    （``ping_fn`` 是阻塞实现，用 ``asyncio.to_thread`` 避免阻塞事件循环），
+    节流与持久化语义不变。
+    """
+    if _throttled():
+        logging.getLogger(__name__).debug(
+            "跨主机故障转移：处于 %ss 节流窗口内，跳过本次测速",
+            _FAILOVER_PING_THROTTLE_SEC,
+        )
+        return None
+    try:
+        ranked = await asyncio.to_thread(ping_fn, hosts, port, ping_timeout)
+    finally:
+        _mark_failover_done()
+    for host, _latency in ranked:
+        if host != current_host:
+            save_fn(host)
+            logging.getLogger(__name__).info("跨主机故障转移：从 %s 切换到 %s", current_host, host)
+            return host
+    return None
+
+
+# 空数据故障转移时最多尝试多少台候选主机（按延迟升序）。统计指数等数据
+# 并非所有服务器都提供，延迟最低的不一定返回数据，故需轮询前几台。
+_WORKING_HOST_MAX_ATTEMPTS = 5
+
+# 验证函数签名：(host) -> True 表示该主机可用（如返回非空数据）。
+TryFn = Callable[[str], bool]
+AsyncTryFn = Callable[[str], Awaitable[bool]]
+
+
+def find_working_host_sync(
+    ranked_hosts: list[tuple[str, float]],
+    try_fn: TryFn,
+    save_fn: SaveFn,
+    current_host: str,
+    max_attempts: int = _WORKING_HOST_MAX_ATTEMPTS,
+) -> str | None:
+    """按延迟顺序逐台测试候选主机，返回第一台"可用"的（同步）。
+
+    与 :func:`select_best_host_sync` 的区别：后者只按延迟选一台（用于连接
+    失败的故障转移）；本函数用于"连接成功但数据空"的场景（如 ``get_market_stat``
+    的统计指数 880005/880001/880006 并非所有服务器都提供），需逐台实际查询
+    才能确定哪台返回有效数据。
+
+    Args:
+        ranked_hosts: 已按延迟升序排序的 ``[(host, latency), ...]``（来自
+            ``ping_fn`` 的返回值）。
+        try_fn: 对单台主机的验证函数，返回 ``True`` 表示该主机可用（如返回
+            非空数据）。调用方在其中负责连接、查询、清理。
+        save_fn: 持久化函数，选中可用主机后调用。
+        current_host: 当前主机（跳过，它已被判定不可用）。
+        max_attempts: 最多尝试多少台候选（默认 5），避免极端情况下逐台试探
+            全部候选拖垮响应。
+
+    Returns:
+        第一台可用的主机（已 ``save_fn`` 持久化）；全部不可用则返回 ``None``。
+    """
+    log = logging.getLogger(__name__)
+    tried = 0
+    for host, _latency in ranked_hosts:
+        if host == current_host:
+            continue
+        if tried >= max_attempts:
+            break
+        tried += 1
+        try:
+            if try_fn(host):
+                save_fn(host)
+                log.info(
+                    "空数据故障转移：从 %s 切换到 %s（第 %d 台候选可用）",
+                    current_host,
+                    host,
+                    tried,
+                )
+                return host
+        except Exception:
+            # 验证单台主机时的任何异常（连接失败、解析错误等）都只跳过该台，
+            # 继续尝试下一台，不让单台拖垮整个轮询。
+            log.debug("空数据故障转移：%s 验证失败，尝试下一台", host, exc_info=True)
+    return None
+
+
+async def find_working_host_async(
+    ranked_hosts: list[tuple[str, float]],
+    try_fn: AsyncTryFn,
+    save_fn: SaveFn,
+    current_host: str,
+    max_attempts: int = _WORKING_HOST_MAX_ATTEMPTS,
+) -> str | None:
+    """按延迟顺序逐台测试候选主机，返回第一台"可用"的（异步）。
+
+    与 :func:`find_working_host_sync` 语义一致；``try_fn`` 为 async 函数。
+    """
+    log = logging.getLogger(__name__)
+    tried = 0
+    for host, _latency in ranked_hosts:
+        if host == current_host:
+            continue
+        if tried >= max_attempts:
+            break
+        tried += 1
+        try:
+            if await try_fn(host):
+                save_fn(host)
+                log.info(
+                    "空数据故障转移：从 %s 切换到 %s（第 %d 台候选可用）",
+                    current_host,
+                    host,
+                    tried,
+                )
+                return host
+        except Exception:
+            log.debug("空数据故障转移：%s 验证失败，尝试下一台", host, exc_info=True)
+    return None
 
 
 class AsyncHeartbeatMixin:

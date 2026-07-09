@@ -73,7 +73,7 @@ class BacktestEngine:
             min_commission: Minimum commission per trade
             stamp_tax: Stamp tax rate (for sells)
             slippage: Slippage rate
-            execution: Execution mode ('next_open', 'this_close')
+            execution: Execution mode ('next_open', 'next_close')
             position_mode: Position mode ('full', 'long_only', 'short_only')
             reject_policy: Reject policy ('reduce', 'reject')
             benchmark: Benchmark data for performance comparison
@@ -135,7 +135,6 @@ class BacktestEngine:
         if self._execution_model is not None:
             # ExecutionModel path
             trades = self._execute_with_model(signals, df)
-            future_leak = False
         else:
             # OrderSimulator path (default)
             simulator = OrderSimulator(
@@ -154,7 +153,6 @@ class BacktestEngine:
                 cash=self._cash,
                 position=0.0,
             )
-            future_leak = simulator.future_leak_warning
 
         # Step 3: Portfolio tracking
         trades = self._compute_pnls(trades)
@@ -176,7 +174,6 @@ class BacktestEngine:
             "execution": self._execution,
             "position_mode": self._position_mode,
             "reject_policy": self._reject_policy,
-            "future_leak_warning": future_leak,
         }
 
         return BacktestResult(
@@ -440,6 +437,8 @@ class BacktestEngine:
                     if position_size > 0:
                         avg_cost = position_cost / position_size
                         trade.pnl = (trade.price - avg_cost) * trade.size - trade.commission
+                        # 记录本次卖出对应的持仓成本基数，用于派生单笔收益率
+                        trade.cost_basis = avg_cost * trade.size
                         position_cost -= avg_cost * trade.size
                         position_size -= trade.size
                     else:
@@ -466,6 +465,7 @@ class BacktestEngine:
                     "commission",
                     "slippage",
                     "pnl",
+                    "cost_basis",
                     "rejected",
                 ]
             )
@@ -479,6 +479,7 @@ class BacktestEngine:
                 "commission": t.commission,
                 "slippage": t.slippage,
                 "pnl": t.pnl,
+                "cost_basis": t.cost_basis,
                 "rejected": t.rejected,
             }
             for t in trades

@@ -225,11 +225,15 @@ class RegisteredStrategy:
 
     def to_schema(self) -> dict[str, Any]:
         """序列化为 JSON 兼容的策略描述（供前端策略下拉框 + 参数表单）。"""
+        # 延迟导入避免 presets ↔ registry 循环依赖
+        from easy_tdx.backtest.strategies.presets import get_preset
+
         return {
             "name": self.name,
             "label": self.label,
             "description": self.description,
             "params": [p.to_schema() for p in self.params],
+            "preset_grid": get_preset(self.name),
         }
 
     def build(

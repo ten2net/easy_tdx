@@ -77,74 +77,6 @@ class TestExecutionModes:
         assert len(trades) == 1
         assert trades[0].price == 102.0  # df["close"].iloc[1]
 
-    def test_this_close(self) -> None:
-        """this_close: 当前K线的收盘价。"""
-        df = _make_df(10)
-        sim = OrderSimulator(df, execution="this_close")
-
-        signals = [_buy_signal(0, size=100)]
-        trades = sim.simulate(signals, cash=20000, position=0)
-
-        assert len(trades) == 1
-        assert trades[0].price == 101.0  # df["close"].iloc[0]
-
-    def test_this_close_future_leak_warning(self) -> None:
-        """this_close 模式应设置 future_leak_warning 标志。"""
-        df = _make_df(10)
-        sim = OrderSimulator(df, execution="this_close")
-
-        assert sim.future_leak_warning is False
-
-        # 执行模拟后应设置标志
-        signals = [_buy_signal(0, size=100)]
-        sim.simulate(signals, cash=20000, position=0)
-
-        assert sim.future_leak_warning is True
-
-    def test_worst_price_buy(self) -> None:
-        """worst: 买入取最高价。"""
-        df = _make_df(10)
-        sim = OrderSimulator(df, execution="worst")
-
-        signals = [_buy_signal(0, size=100)]
-        trades = sim.simulate(signals, cash=20000, position=0)
-
-        assert len(trades) == 1
-        assert trades[0].price == 103.0  # df["high"].iloc[1]
-
-    def test_worst_price_sell(self) -> None:
-        """worst: 卖出取最低价。"""
-        df = _make_df(10)
-        sim = OrderSimulator(df, execution="worst")
-
-        signals = [_sell_signal(0, size=100)]
-        trades = sim.simulate(signals, cash=0, position=200)
-
-        assert len(trades) == 1
-        assert trades[0].price == 100.0  # df["low"].iloc[1]
-
-    def test_best_price_buy(self) -> None:
-        """best: 买入取最低价。"""
-        df = _make_df(10)
-        sim = OrderSimulator(df, execution="best")
-
-        signals = [_buy_signal(0, size=100)]
-        trades = sim.simulate(signals, cash=20000, position=0)
-
-        assert len(trades) == 1
-        assert trades[0].price == 100.0  # df["low"].iloc[1]
-
-    def test_best_price_sell(self) -> None:
-        """best: 卖出取最高价。"""
-        df = _make_df(10)
-        sim = OrderSimulator(df, execution="best")
-
-        signals = [_sell_signal(0, size=100)]
-        trades = sim.simulate(signals, cash=0, position=200)
-
-        assert len(trades) == 1
-        assert trades[0].price == 103.0  # df["high"].iloc[1]
-
 
 # ── Test Position Modes ────────────────────────────────────────────────────────
 
@@ -489,16 +421,3 @@ class TestNonContinuousIndex:
         # position 1 的 open = 101.0；旧代码会用 label 10 当位置 → iloc[10] 越界
         assert trades[0].price == 101.0
         assert trades[0].rejected is False
-
-    def test_this_close_with_non_continuous_index(self) -> None:
-        """this_close 模式下信号在 bar 2（label=30），应在同根 close 成交。"""
-        df = _make_df(10)
-        df.index = [10 * (i + 1) for i in range(len(df))]
-        sim = OrderSimulator(df, execution="this_close")
-
-        signals = [_buy_signal(2, size=100)]
-        trades = sim.simulate(signals, cash=20000, position=0)
-
-        assert len(trades) == 1
-        # position 2 的 close = 103.0
-        assert trades[0].price == 103.0

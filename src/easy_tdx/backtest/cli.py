@@ -32,7 +32,7 @@ import click
 @click.option(
     "--execution",
     default="next_open",
-    type=click.Choice(["next_open", "next_close", "this_close", "worst", "best"]),
+    type=click.Choice(["next_open", "next_close"]),
     help="成交价规则",
 )
 @click.option("--period", default="DAILY", help="K线周期")
@@ -298,7 +298,7 @@ def _print_table(result: Any) -> None:
 @click.option(
     "--execution",
     default="next_open",
-    type=click.Choice(["next_open", "next_close", "this_close", "worst", "best"]),
+    type=click.Choice(["next_open", "next_close"]),
     help="成交价规则",
 )
 @click.option("--period", default="DAILY", help="K线周期")

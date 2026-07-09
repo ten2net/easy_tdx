@@ -5,7 +5,9 @@
 [![GitHub Repo stars](https://img.shields.io/github/stars/handsomejustin/easy-tdx?style=social)](https://github.com/handsomejustin/easy-tdx)
 [![GitHub last commit](https://img.shields.io/github/last-commit/handsomejustin/easy-tdx)](https://github.com/handsomejustin/easy-tdx)
 [![Checked with mypy](http://www.mypy-lang.org/static/mypy_badge.svg)](http://www.mypy-lang.org/)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/handsomejustin/easy_tdx)
 
+<img src="./docs/top_img.png" alt="头部宣传图" />
 量化基金花百万买的毫秒级行情通道，散户连一根日线都要手动截图——这不是技术差距，这是数据霸凌。
 
 easy-tdx 要做的事很简单：**把机构的数据锁砸开，扔到每个普通人桌面。**
@@ -17,7 +19,9 @@ easy-tdx 要做的事很简单：**把机构的数据锁砸开，扔到每个普
 **缠论分析**（笔、中枢、买卖点、背驰）一键出结果——你不再需要手画分型、猜线段。
 **内置回测引擎**——写个策略文件，一行命令跑回测，18 个经典策略自带，多因子组合、策略选股扫描，批量对比哪个最赚钱一目了然。
 
-**回测可视化 Web UI**（v1.17 新增）——Vue3 + ECharts 单页应用，浏览器里选标的、挑策略、调参数，K 线买卖点、净值回撤、19 项绩效指标一目了然。支持组合回测、参数网格寻优、多策略结果对比，全程零代码。
+**回测可视化 Web UI**（v1.17 新增）——Vue3 + ECharts 单页应用，浏览器里选标的、挑策略、调参数，K 线买卖点、净值回撤、19 项绩效指标一目了然。支持组合回测、参数网格寻优、多策略结果对比，**还能把好策略存进策略库（SQLite 持久化），勾选多个策略做资金分仓组合回测看综合表现**，全程零代码。
+
+**数据评级系统**（v1.17.14 新增）——回测结果顶部直接显示 **S/A/B/C/D 五档评级徽章**，1 秒判断「这个品种适不适合经常参与」。评级**不看收益率**（避免被近期大涨误导），只看风险调整后的持有体验：卡玛比率、最大回撤、胜率、利润因子、夏普、波动率六维加权 + 一票否决（系统亏损/深回撤/低胜率直接低评）。京东方那种「收益 126% 但胜率 35%、回撤 41%」的案例会评 **D 档**——明确告诉普通人「别碰，套牢后回本极难」。三个入口（单标的/组合/寻优）都有评级，长线低频策略不会被冤枉（交易少时只降权胜率维度，不否决整个评级）。
 
 装上就能跑。**Python API + CLI + Web API 三通道**，输出 JSON 天然喂给 AI Agent：Claude Code、OpenClaw、Hermes 直接吃。`easy-tdx serve` 一键起 REST 服务，浏览器打开就是交互式 API 文档。
 
@@ -436,32 +440,45 @@ easy-tdx portfolio --stocks SZ:000001,SH:600519 \
 
 **回测可视化 Web UI（v1.17 新增）：**
 
-不想写命令行？用浏览器。`easy-tdx serve` 启动后端，`web-ui/` 目录跑前端，浏览器打开就是完整的回测可视化界面。
+<img src="./docs/web-ui-page-1.png" alt="Web UI 截图 1" />
+
+<img src="./docs/web-ui-page-2.png" alt="Web UI 截图 2" />
+
+<img src="./docs/web-ui-page-3.png" alt="Web UI 截图 3" />
+
+不想写命令行？用浏览器。`easy-tdx serve` 一条命令启动，浏览器自动打开 `http://localhost:8000`，就是完整的回测可视化界面。
 
 **前置条件：**
 
 ```bash
-# 后端需安装 web 可选依赖（FastAPI + Uvicorn）
+# 需安装 web 可选依赖（FastAPI + Uvicorn）
 pip install -e ".[web]"
-
-# 前端需 Node.js 18+（首次运行需装依赖）
-cd web-ui && npm install
 ```
 
-**启动（两个终端）：**
+**启动（一条命令）：**
 
 ```bash
-# 终端 1：启动后端 API 服务（提供行情数据 + 回测计算）
-easy-tdx serve --port 8000
+# 启动后端 + 自动打开浏览器（默认 http://localhost:8000）
+easy-tdx serve
 
-# 终端 2：启动前端开发服务器（web-ui/ 目录）
-cd web-ui && npm run dev
-# 浏览器打开 http://localhost:5173
+# 自定义端口/不自动开浏览器
+easy-tdx serve --port 8080 --no-open-browser
 ```
 
-> 前端开发服务器通过 Vite proxy 把 `/api` 请求转发到后端 `127.0.0.1:8000`，无需处理跨域。后端行情连接失败时回测路由仍可用（用内联数据），但取行情功能需要后端连通通达信服务器。
+> 后端启动后约 1-2 秒会自动弹出浏览器。前端界面已编译进 `web-ui/dist/`，由后端同源托管，无需单独跑前端开发服务器。后端行情连接失败时回测路由仍可用（用内联数据），但取行情功能需要后端连通通达信服务器。
 
-打开浏览器后，顶部导航栏有四个页面：
+**不想装 Python？下载 EXE 直接用（面向零基础用户）：**
+
+Windows 用户可以下载打包好的单一 EXE（约 80-150MB），双击即可使用，无需安装 Python/Node 或任何依赖：
+
+1. 到 [Releases 页面](../../releases) 下载最新的 `easy-tdx-<版本>-windows.exe`
+2. 双击运行（首次会被 SmartScreen 拦截，点"更多信息 → 仍要运行"）
+3. 等待 2-5 秒，浏览器自动打开回测界面
+4. 右下角任务栏出现小图标，右键 → "退出" 可关闭
+
+EXE 打包方法见 [`docs/packaging.md`](./docs/packaging.md)。
+
+打开浏览器后，顶部导航栏有五个页面：
 
 **1. 单标的回测**（首页 `/`）
 
@@ -471,11 +488,13 @@ cd web-ui && npm run dev
 - **选策略**：下拉选 18 个内置策略之一（双均线交叉、MACD、布林带、RSI、KDJ、唐安奇通道、CCI 等），选中后参数表单自动出现，按推荐范围调参
 - **资金与成本**：初始资金、佣金率、滑点、成交模式（默认 next_open 下一根开盘成交）
 - 点「开始回测」，右侧依次出：K 线主图（红三角=买入、绿钉=卖出）、净值曲线与回撤双轴图、19 项绩效指标表（总收益/夏普/最大回撤/胜率/盈亏比等）、成交记录明细
+- 结果区右上角有「💾 保存策略」按钮，把当前策略 + 标的 + 成绩快照存进策略库，下次直接载入或参与组合回测
 
 **2. 组合回测**（`/portfolio`）
 
 - 添加多只标的（如 SZ:000001、SH:600519），选策略和日期范围
 - 点「开始组合回测」，右侧出：组合整体绩效（加权收益率）、组合净值曲线（各标的按日期对齐求和）、各标的净值归一化叠加对比图、各标的绩效横向对比表
+- 同样有「保存策略」按钮，可把整个组合配置存进策略库
 
 **3. 参数寻优**（`/optimize`）
 
@@ -489,9 +508,16 @@ cd web-ui && npm run dev
 - 左侧列出最近 20 个已完成的回测任务（含单标的和组合）
 - 勾选 2-4 个，右侧出：归一化净值叠加图（初始=1，看相对走势）、8 项核心指标横向对比表（总收益/夏普/最大回撤/胜率/盈亏比/交易数/年化/波动率）
 
-> ⚠️ **任务不持久化**：回测结果存在后端进程内存，重启 `easy-tdx serve` 后清空。对比页只能选当前运行期间产生的任务。
+**5. 策略库**（`/strategies`，v1.17.11 新增）
 
-技术栈：Vue 3 + Vite + TypeScript + Pinia + ECharts（按需引入，构建产物约 725KB）。前端代码在 `web-ui/` 目录，独立 `package.json`，不依赖 Python 环境。
+- 保存你觉得不错的策略，下次直接载入或重跑。数据存在本地 SQLite 单文件（`~/.easy_tdx/strategies.db`，重启不丢）
+- 每张卡片展示策略名、标的、保存时的成绩快照（总收益/夏普/回撤）、标签、备注、创建时间
+- **载入**：点「载入」跳转对应回测页（单标的/组合），自动回填标的、日期、策略参数，可直接重跑
+- **多策略组合回测**：勾选多个单标的策略（卡片左上角复选框），点顶部「组合回测(N)」——每个策略各拿 1/N 资金、各跑在它保存时的原标的上（取最新行情），净值曲线按日期对齐求和，看综合表现。结果区展示：组合净值曲线、19 项完整绩效指标（与单标的同口径）、各策略绩效对比表、净值叠加图、各策略当前持仓表（回测结束时谁还套着票）
+
+> ⚠️ **任务不持久化**：回测结果存在后端进程内存，重启 `easy-tdx serve` 后清空。对比页只能选当前运行期间产生的任务。**策略库除外**——保存到策略库的策略持久存在 SQLite，重启不丢。
+
+技术栈：Vue 3 + Vite + TypeScript + Pinia + ECharts（按需引入，构建产物约 800KB）。前端代码在 `web-ui/` 目录，独立 `package.json`，不依赖 Python 环境。
 
 
 
@@ -1368,6 +1394,8 @@ with MacClient.from_best_host() as c:
 ### 扩展市场
 
 ```python
+from datetime import date
+
 from easy_tdx import MacExClient, ExMarket, Period
 
 with MacExClient.from_best_host() as c:
@@ -1377,7 +1405,10 @@ with MacExClient.from_best_host() as c:
     df = c.goods_quotes([(ExMarket.HK_MAIN_BOARD, "00700")])
     df = c.goods_tick_chart(ExMarket.HK_MAIN_BOARD, "00700")
     df = c.goods_transaction(ExMarket.HK_MAIN_BOARD, "00700", count=100)
+    df = c.goods_transaction_all(ExMarket.HK_MAIN_BOARD, "00700", date(2026, 7, 3))  # 港股当日全部逐笔
 ```
+
+> **逐笔成交排序**：通达信协议为**倒序**——`start=0` 指向最新一笔（收盘方向），`count=2000` 默认只取最近 2000 笔。港股单日成交常达数万笔（如 02715 约 1.3 万笔/日），若需当日全部成交，用 `goods_transaction_all`（仅港股股票类市场，自动按 1800/页翻页取全天，安全上限 9 万条；返回协议原生倒序，需正序展示自行 `df.iloc[::-1]`）。
 
 ### 统一客户端
 

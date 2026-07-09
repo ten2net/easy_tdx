@@ -26,14 +26,13 @@ class OrderSimulator:
 
     Attributes:
         df: K线数据 DataFrame
-        execution: 成交价规则 (next_open/next_close/this_close/worst/best)
+        execution: 成交价规则 (next_open/next_close)
         position_mode: 仓位模式 (full/fixed/percent)
         reject_policy: 拒绝策略 (reduce/skip)
         commission: 佣金费率
         min_commission: 最低佣金
         stamp_tax: 印花税率（仅卖出）
         slippage: 滑点（每股）
-        future_leak_warning: 是否使用了未来数据（this_close 模式）
     """
 
     df: pd.DataFrame
@@ -45,7 +44,6 @@ class OrderSimulator:
     stamp_tax: float = 0.001
     slippage: float = 0.0
     slippage_model: SlippageModel | None = None
-    future_leak_warning: bool = False
 
     def simulate(
         self,
@@ -195,26 +193,23 @@ class OrderSimulator:
     def _resolve_exec_index(self, bar_idx: int) -> int | None:
         """根据执行模式确定成交的 K 线索引。
 
+        开盘价 / 收盘价模式均在信号后一根 K 线成交（next_open 取次根开盘价，
+        next_close 取次根收盘价），避免使用信号当根的未完成/未来数据。
+
         Args:
             bar_idx: 信号对应的 K 线索引
 
         Returns:
             成交 K 线索引
         """
-        if self.execution == "this_close":
-            # 当信号 K 线收盘时成交
-            self.future_leak_warning = True
-            return bar_idx
-        else:
-            # 其他模式在下一根 K 线成交
-            return bar_idx + 1
+        return bar_idx + 1
 
     def _get_price(self, exec_idx: int, direction: str) -> float | None:
-        """根据执行模式和方向获取成交价。
+        """根据执行模式获取成交价。
 
         Args:
             exec_idx: 成交 K 线索引
-            direction: 交易方向
+            direction: 交易方向（仅作保留，当前两种模式均不依赖方向）
 
         Returns:
             成交价格
@@ -228,14 +223,6 @@ class OrderSimulator:
             return float(row["open"])
         elif self.execution == "next_close":
             return float(row["close"])
-        elif self.execution == "this_close":
-            return float(row["close"])
-        elif self.execution == "worst":
-            # 买入取最高价，卖出取最低价
-            return float(row["high"]) if direction == "BUY" else float(row["low"])
-        elif self.execution == "best":
-            # 买入取最低价，卖出取最高价
-            return float(row["low"]) if direction == "BUY" else float(row["high"])
         else:
             return None
 

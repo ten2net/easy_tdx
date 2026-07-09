@@ -191,7 +191,7 @@ def test_backtest_request_defaults():
     from easy_tdx.web.backtest_schemas import BacktestRequest
 
     req = BacktestRequest(strategy="ma_cross", symbol="SZ:000001")
-    assert req.cash == 100000.0
+    assert req.cash == 1_000_000.0
     assert req.commission == 0.0003
     assert req.execution == "next_open"
     assert req.category == "DAY"
@@ -306,23 +306,38 @@ def test_task_runner_captures_failure():
 
 
 def test_task_runner_lru_eviction():
-    """超过上限应丢弃最旧任务。"""
+    """超过上限应丢弃最旧的非 running 任务。
+
+    注意：淘汰发生在 submit 时，淘汰对象是「当时最旧的非 running 任务」。
+    用 max_workers=1 串行执行时，哪个任务被淘汰取决于提交速度 vs 执行速度
+    的竞态（快机器上 t0 还在 running 会被跳过，慢机器上 t0 已完成会被淘汰）。
+    所以本测试不断言「特定 task_id 被淘汰」，而是验证：
+    (1) 存活的 non-running 任务数 ≤ max_results
+    (2) 最后提交的任务一定存活（它是最近的，不可能被 LRU 淘汰）
+    (3) 至少有 2 个任务被淘汰（5 提交 - 3 上限 = 2）
+    """
     from easy_tdx.web.task_runner import BacktestTaskRunner
 
     runner = BacktestTaskRunner(max_workers=1, max_results=3)
     ids = [runner.submit(lambda: {"i": i}, description=f"t{i}") for i in range(5)]
-    # 等待全部完成
+    # 等待存活的任务全部完成（被淘汰的 peek 返回 None，跳过）
     for _ in range(200):
-        if all(runner.peek(tid) and runner.peek(tid).status in ("done", "failed") for tid in ids):
+        alive = [tid for tid in ids if runner.peek(tid) is not None]
+        if all(runner.peek(tid).status in ("done", "failed") for tid in alive):
             break
         time.sleep(0.02)
 
-    # 前 2 个应被淘汰
-    assert runner.peek(ids[0]) is None
-    assert runner.peek(ids[1]) is None
-    # 后 3 个保留
-    assert runner.peek(ids[2]) is not None
-    assert runner.peek(ids[4]) is not None
+    # 最后提交的任务一定存活（LRU 最近，不可能被淘汰）
+    assert runner.peek(ids[4]) is not None, "最后提交的任务不应被淘汰"
+
+    # 至少淘汰 2 个（5 提交 - max_results 3 = 2）
+    surviving = [tid for tid in ids if runner.peek(tid) is not None]
+    evicted = [tid for tid in ids if runner.peek(tid) is None]
+    assert len(evicted) >= 2, f"应至少淘汰 2 个任务，实际淘汰 {len(evicted)} 个"
+
+    # 存活任务数不超过 max_results（running 完成后）
+    assert len(surviving) <= 3, f"存活任务 {len(surviving)} 超过上限 3"
+
     runner.shutdown()
 
 
@@ -354,7 +369,10 @@ def test_task_runner_does_not_evict_running(monkeypatch):
 
     def slow_task() -> dict[str, object]:
         started.set()
-        release.wait(timeout=5)
+        # 无短超时：CI 慢环境（如 windows 3.10）下 5s 可能不够整个测试跑完，
+        # 任务会因超时自动完成导致状态变 done，掩盖「running 被淘汰」的回归。
+        # release.set()（测试末尾）是唯一释放点；若回归发生，断言会先失败。
+        release.wait(timeout=30)
         return {"slow": True}
 
     running_id = runner.submit(slow_task, description="slow")
@@ -704,7 +722,7 @@ def test_portfolio_request_defaults():
     from easy_tdx.web.backtest_schemas import PortfolioBacktestRequest
 
     req = PortfolioBacktestRequest(strategy="ma_cross", stocks=["SZ:000001"])
-    assert req.cash == 200000.0
+    assert req.cash == 1_000_000.0
     assert req.category == "DAY"
 
 
@@ -897,6 +915,55 @@ def test_optimize_single_param_no_heatmap(client, sample_ohlcv):
         time.sleep(0.05)
     assert final["status"] == "done"
     assert final["result"]["heatmap"] is None
+
+
+def test_optimize_all_endpoint(client, sample_ohlcv):
+    """POST /backtest/optimize-all/run/async 端到端：逐策略预设网格寻优 + 全局排名。"""
+    resp = client.post(
+        "/api/v1/backtest/optimize-all/run/async",
+        json={
+            "cash": 1_000_000,
+            "ohlcv": sample_ohlcv,
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+
+    final = None
+    for _ in range(400):
+        poll = client.get(f"/api/v1/backtest/tasks/{task_id}")
+        final = poll.json()
+        if final["status"] in ("done", "failed"):
+            break
+        time.sleep(0.05)
+
+    assert final["status"] == "done", final
+    result = final["result"]
+    # 排名按 total_return 降序、best 指向第一名、各策略最优点齐全
+    assert "ranking" in result and len(result["ranking"]) > 0
+    assert "best" in result and result["best"] is not None
+    assert "per_strategy" in result and len(result["per_strategy"]) == len(result["ranking"])
+    assert "total_grid_points" in result and result["total_grid_points"] > 0
+    # ranking 降序校验
+    returns = [r["total_return"] for r in result["ranking"]]
+    assert returns == sorted(returns, reverse=True)
+    # best == ranking[0]
+    assert result["best"]["strategy"] == result["ranking"][0]["strategy"]
+    # 合计网格点 == 各策略 grid_points 之和
+    assert result["total_grid_points"] == sum(r["grid_points"] for r in result["ranking"])
+
+
+def test_optimize_all_request_validation():
+    """optimize-all 请求必须提供数据源。"""
+    from easy_tdx.web.backtest_schemas import OptimizeAllBacktestRequest
+
+    # 缺数据源
+    with pytest.raises(ValueError):
+        OptimizeAllBacktestRequest()
+    # 合法
+    req = OptimizeAllBacktestRequest(symbol="SZ:000001")
+    assert req.cash == 1_000_000.0
+    assert req.execution == "next_open"
 
 
 # ---------------------------------------------------------------------------

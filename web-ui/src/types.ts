@@ -22,6 +22,7 @@ export interface StrategySchema {
   label: string
   description: string
   params: ParamSchema[]
+  preset_grid?: Record<string, Array<number | string>>
 }
 
 export interface StrategiesResponse {
@@ -48,7 +49,7 @@ export interface DataFrameResponse {
 
 // ── 回测请求（POST /api/v1/backtest/run） ─────────────────────────────────────
 
-export type ExecutionMode = 'next_open' | 'next_close' | 'this_close' | 'worst' | 'best'
+export type ExecutionMode = 'next_open' | 'next_close'
 export type Category = 'DAY' | 'WEEK' | 'MONTH' | 'MIN_5' | 'MIN_15' | 'MIN_30' | 'MIN_60'
 
 export interface BacktestRequest {
@@ -130,7 +131,7 @@ export type TaskStatus = 'pending' | 'running' | 'done' | 'failed'
 export interface TaskState {
   task_id: string
   status: TaskStatus
-  result: BacktestResult | PortfolioResult | OptimizeResult | null
+  result: BacktestResult | PortfolioResult | OptimizeResult | OptimizeAllResult | null
   error: string | null
   description: string
   elapsed: number
@@ -221,9 +222,136 @@ export interface OptimizeResult {
   heatmap: OptimizeHeatmap | null
 }
 
+// ── 一键寻优所有策略（Phase 6） ──────────────────────────────────────────────
+
+export interface OptimizeAllBacktestRequest {
+  cash?: number
+  commission?: number
+  slippage?: number
+  execution?: ExecutionMode
+  workers?: number
+  ohlcv?: Bar[]
+  symbol?: string
+  category?: Category
+  count?: number
+  start_date?: string
+  end_date?: string
+}
+
+export interface OptimizeAllRankEntry {
+  strategy: string
+  strategy_label: string
+  params: Record<string, number | string>
+  total_return: number | null
+  sharpe: number | null
+  max_drawdown: number | null
+  total_trades: number
+  win_rate: number | null
+  profit_factor: number | null
+  grid_points: number
+}
+
+export interface OptimizeAllResult {
+  ranking: OptimizeAllRankEntry[]
+  best: OptimizeAllRankEntry | null
+  per_strategy: Record<string, OptimizeAllRankEntry>
+  total_grid_points: number
+}
+
 // ── 错误响应（后端 ApiErrorResponse） ─────────────────────────────────────────
 
 export interface ApiError {
   error: string
   detail: string
+}
+
+// ── 策略库（已保存策略，GET/POST/DELETE /api/v1/strategies） ─────────────────
+
+/** 新建一条已保存策略的请求体（前端在回测结果区点「保存」时提交）。 */
+export interface SavedStrategyCreate {
+  name: string
+  kind: 'single' | 'portfolio' | 'multi'
+  strategy: string
+  strategy_label?: string
+  params?: Record<string, number | string | boolean>
+  /** 标的上下文：single 存 symbol/category/start_date/end_date；portfolio 存 stocks；multi 存 items + cash/execution */
+  context?: Record<string, unknown>
+  /** 资金与成本配置（cash/commission/...） */
+  trade_config?: Record<string, unknown>
+  /** 保存时的成绩快照（total_return/sharpe/...） */
+  snapshot?: Record<string, unknown>
+  tags?: string[]
+  notes?: string
+}
+
+/** 一条已保存策略（响应模型，含 id 与时间戳）。 */
+export interface SavedStrategy {
+  id: string
+  name: string
+  kind: 'single' | 'portfolio' | 'multi'
+  strategy: string
+  strategy_label: string
+  params: Record<string, number | string | boolean>
+  context: Record<string, unknown>
+  trade_config: Record<string, unknown>
+  snapshot: Record<string, unknown>
+  tags: string[]
+  notes: string
+  created_at: string
+  updated_at: string
+  app_version: string
+}
+
+export interface SavedStrategyListResponse {
+  strategies: SavedStrategy[]
+  count: number
+}
+
+// ── 多策略组合回测（资金分仓，POST /api/v1/backtest/multi-strategy/run/async） ──
+
+/** 多策略组合的单个策略槽位（一个策略 + 参数 + 它要跑的原标的 + 日期）。 */
+export interface MultiStrategyItem {
+  strategy: string
+  strategy_label?: string
+  params?: Record<string, number | string | boolean>
+  symbol: string
+  category?: Category
+  start_date?: string
+  end_date?: string
+}
+
+/** 多策略组合回测请求（各策略各拿 1/N 资金，结果结构同 PortfolioResult）。 */
+export interface MultiStrategyBacktestRequest {
+  items: MultiStrategyItem[]
+  cash?: number
+  commission?: number
+  min_commission?: number
+  stamp_tax?: number
+  slippage?: number
+  execution?: ExecutionMode
+}
+
+// ── 服务器设置（GET /api/v1/server/hosts 等） ────────────────────────────────
+
+/** 单个通达信服务器的状态信息。 */
+export interface ServerHostInfo {
+  host: string
+  /** 延迟（毫秒）。null = 未测速或不可达。 */
+  latency_ms: number | null
+  reachable: boolean
+  is_current: boolean
+}
+
+/** GET /server/hosts 的响应。 */
+export interface ServerHostListResponse {
+  hosts: ServerHostInfo[]
+  current_host: string
+  total: number
+}
+
+/** POST /server/switch 的响应。 */
+export interface ServerSwitchResult {
+  ok: boolean
+  host: string
+  message: string
 }

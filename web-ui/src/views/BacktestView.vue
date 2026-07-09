@@ -1,31 +1,55 @@
 <script setup lang="ts">
 // 回测主页面：左配置面板 / 右报告面板。
-// 编排：取行情 → 选策略+参数 → 回测 → 展示 K线+净值+指标+成交。
+// 编排：点击「开始回测」→ 自动取行情 → 回测 → 展示 K线+净值+指标+成交。
+// 取行情已整合进「开始回测」（不再有单独的取行情按钮）。
 
-import { nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
 import EquityChart from '../components/EquityChart.vue'
+import GradeDetails from '../components/GradeDetails.vue'
 import KlineChart from '../components/KlineChart.vue'
 import MetricTable from '../components/MetricTable.vue'
 import StrategyPicker from '../components/StrategyPicker.vue'
 import SymbolPicker from '../components/SymbolPicker.vue'
 import TradeTable from '../components/TradeTable.vue'
-import type { ExecutionMode } from '../types'
+import { formatError, saveStrategy } from '../api'
+import { detectMarket } from '../market'
+import { gradePerformance } from '../grading'
+import type { Category, ExecutionMode } from '../types'
 import { useBacktestStore } from '../stores/backtest'
 
 const store = useBacktestStore()
 const route = useRoute()
 
+// SymbolPicker 实例引用，用于触发取行情
+const symbolPicker = ref<InstanceType<typeof SymbolPicker> | null>(null)
+
+// 镜像 SymbolPicker 的代码/周期/日期，与 SymbolPicker 通过 v-model 双向同步。
+// 初始值与 SymbolPicker 默认一致；onMounted 时若 URL query 带了寻优页传来的值则覆盖。
+const code = ref('000001')
+const category = ref<Category>('DAY')
+function isoDaysFromNow(days: number): string {
+  const d = new Date()
+  d.setDate(d.getDate() + days)
+  return d.toISOString().slice(0, 10)
+}
+const startDate = ref('2020-01-06')
+const endDate = ref(isoDaysFromNow(0))
+
 // 表单状态（v-model 给子组件）
 const strategy = ref('ma_cross')
 const params = ref<Record<string, number | string | boolean>>({})
-const cash = ref(100000)
+const cash = ref(1000000)
 const commission = ref(0.0003)
 const slippage = ref(0)
 const execution = ref<ExecutionMode>('next_open')
 
-const EXECUTIONS: ExecutionMode[] = ['next_open', 'next_close', 'this_close', 'worst', 'best']
+// 成交价模式（精简为 开盘价/收盘价）
+const EXECUTIONS: { value: ExecutionMode; label: string }[] = [
+  { value: 'next_open', label: '开盘价' },
+  { value: 'next_close', label: '收盘价' },
+]
 
 onMounted(async () => {
   await store.loadStrategies().catch((e) => {
@@ -48,9 +72,26 @@ onMounted(async () => {
       // query 参数解析失败，忽略
     }
   }
+
+  // 从 URL query 回填标的代码 / 周期 / 日期范围（寻优页「查看」跳转带来）。
+  // 各字段独立 if 守卫：老书签（只有 strategy/params）仍保持默认值，向后兼容。
+  const qSymbol = route.query.symbol as string | undefined
+  const qStartDate = route.query.startDate as string | undefined
+  const qEndDate = route.query.endDate as string | undefined
+  const qCategory = route.query.category as Category | undefined
+  if (qSymbol) code.value = qSymbol
+  if (qStartDate) startDate.value = qStartDate
+  if (qEndDate) endDate.value = qEndDate
+  if (qCategory) category.value = qCategory
 })
 
+// 取行情 + 回测 串联（点击「开始回测」触发）
 async function onRun() {
+  store.error = ''
+  // 1. 先取行情（SymbolPicker.loadBars 会校验并填充 store.ohlcv）
+  const ok = await symbolPicker.value?.loadBars()
+  if (!ok) return // 校验/取数失败，错误已在 store.error
+  // 2. 再回测
   await store.run({
     strategy: strategy.value,
     params: params.value,
@@ -60,6 +101,88 @@ async function onRun() {
     execution: execution.value,
   })
 }
+
+// ── 保存策略（把当前结果 + 配置 + 上下文存进策略库）──────────────────────────
+const showSaveForm = ref(false)
+const saving = ref(false)
+const saveName = ref('')
+const saveTags = ref('')
+const saveNotes = ref('')
+const saveMsg = ref('') // 保存后提示（成功/失败）
+
+const strategyLabel = computed(
+  () => store.strategies.find((s) => s.name === strategy.value)?.label ?? strategy.value,
+)
+
+// 评级：基于完整 Performance，6 维度评分 + 一票否决。
+// total_return 不直接计入评分（只通过卡玛/夏普间接体现），
+// 体现「哪怕近期收益率高，长期风险大也该低评」的产品诉求。
+const grade = computed(() =>
+  store.result ? gradePerformance(store.result.performance) : null,
+)
+
+// 当前股票完整代码（市场:6位），从 SymbolPicker 同步来的 code 是纯数字，
+// 需要带上市场前缀。复用 market.ts 的 detectMarket（与 SymbolPicker /
+// StocksPicker 同一套规则），避免分叉导致 ETF/基金（5 开头）等被错判市场。
+function fullSymbol(code6: string): string {
+  return `${detectMarket(code6)}:${code6}`
+}
+
+function openSaveForm() {
+  saveName.value = `${strategyLabel.value} · ${code.value}`
+  saveTags.value = ''
+  saveNotes.value = ''
+  saveMsg.value = ''
+  showSaveForm.value = true
+}
+
+async function onSave() {
+  if (!store.result || !saveName.value.trim()) return
+  saving.value = true
+  saveMsg.value = ''
+  try {
+    await saveStrategy({
+      name: saveName.value.trim(),
+      kind: 'single',
+      strategy: strategy.value,
+      strategy_label: strategyLabel.value,
+      params: params.value,
+      context: {
+        symbol: fullSymbol(code.value),
+        category: category.value,
+        start_date: startDate.value,
+        end_date: endDate.value,
+      },
+      trade_config: {
+        cash: cash.value,
+        commission: commission.value,
+        min_commission: 5,
+        stamp_tax: 0.001,
+        slippage: slippage.value,
+        execution: execution.value,
+      },
+      snapshot: {
+        total_return: store.result.performance.total_return,
+        annual_return: store.result.performance.annual_return,
+        max_drawdown: store.result.performance.max_drawdown,
+        sharpe: store.result.performance.sharpe,
+        win_rate: store.result.performance.win_rate,
+        trades_count: store.result.performance.total_trades,
+      },
+      tags: saveTags.value
+        .split(/[,，]/)
+        .map((t) => t.trim())
+        .filter(Boolean),
+      notes: saveNotes.value,
+    })
+    saveMsg.value = '✓ 已保存到策略库'
+    showSaveForm.value = false
+  } catch (e) {
+    saveMsg.value = `保存失败：${formatError(e)}`
+  } finally {
+    saving.value = false
+  }
+}
 </script>
 
 <template>
@@ -68,7 +191,13 @@ async function onRun() {
     <aside class="config-panel">
       <section class="panel-section">
         <h3>行情数据</h3>
-        <SymbolPicker />
+        <SymbolPicker
+          ref="symbolPicker"
+          v-model:code="code"
+          v-model:category="category"
+          v-model:start-date="startDate"
+          v-model:end-date="endDate"
+        />
       </section>
 
       <section class="panel-section">
@@ -99,21 +228,20 @@ async function onRun() {
           </div>
         </div>
         <div class="field">
-          <label>成交模式</label>
+          <label>成交价</label>
           <select v-model="execution">
-            <option v-for="e in EXECUTIONS" :key="e" :value="e">{{ e }}</option>
+            <option v-for="e in EXECUTIONS" :key="e.value" :value="e.value">{{ e.label }}</option>
           </select>
         </div>
       </section>
 
       <button
         class="primary run-btn"
-        :disabled="store.running || !store.hasBars"
+        :disabled="store.running"
         @click="onRun"
       >
-        {{ store.running ? '回测中…' : '开始回测' }}
+        {{ store.running ? '取行情+回测中…' : '开始回测' }}
       </button>
-      <p v-if="!store.hasBars" class="hint">请先取行情数据</p>
     </aside>
 
     <!-- 右栏：报告 -->
@@ -121,10 +249,15 @@ async function onRun() {
       <div v-if="store.error" class="error-banner">⚠ {{ store.error }}</div>
 
       <div v-if="!store.result && !store.running && !store.error" class="placeholder">
-        <p>选择标的、取行情、配置策略后点击「开始回测」</p>
+        <p>输入代码、配置策略后点击「开始回测」（自动取行情）</p>
       </div>
 
       <div v-if="store.result" class="report-content">
+        <div class="result-toolbar">
+          <button class="ghost" @click="openSaveForm">💾 保存策略</button>
+          <span v-if="saveMsg" class="save-msg">{{ saveMsg }}</span>
+        </div>
+
         <section class="report-section">
           <h3>K线 + 买卖点</h3>
           <KlineChart :bars="store.ohlcv" :trades="store.result.trades" />
@@ -133,6 +266,11 @@ async function onRun() {
         <section class="report-section">
           <h3>净值曲线与回撤</h3>
           <EquityChart :equity="store.result.equity_curve" />
+        </section>
+
+        <section v-if="grade" class="report-section">
+          <h3>评级</h3>
+          <GradeDetails :result="grade" expanded />
         </section>
 
         <section class="report-section">
@@ -146,6 +284,38 @@ async function onRun() {
         </section>
       </div>
     </main>
+
+    <!-- 保存策略对话框 -->
+    <div v-if="showSaveForm" class="modal-overlay" @click.self="showSaveForm = false">
+      <div class="modal">
+        <h3>保存到策略库</h3>
+        <p class="modal-desc">
+          将当前策略 + 标的上下文 + 成绩快照存下，下次可在「策略库」载入或重跑。
+        </p>
+        <div class="field">
+          <label>名称</label>
+          <input v-model="saveName" type="text" placeholder="给这个策略起个名" />
+        </div>
+        <div class="field">
+          <label>标签（逗号分隔，可选）</label>
+          <input v-model="saveTags" type="text" placeholder="如：银行,长线观察" />
+        </div>
+        <div class="field">
+          <label>备注（可选）</label>
+          <textarea v-model="saveNotes" rows="2" placeholder="为什么觉得它好？"></textarea>
+        </div>
+        <div class="modal-summary">
+          {{ strategyLabel }} · {{ code }} ·
+          {{ store.result ? (store.result.performance.total_return * 100).toFixed(2) + '%' : '' }}
+        </div>
+        <div class="modal-actions">
+          <button class="ghost" :disabled="saving" @click="showSaveForm = false">取消</button>
+          <button class="primary" :disabled="saving || !saveName.trim()" @click="onSave">
+            {{ saving ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -190,12 +360,6 @@ async function onRun() {
   padding: 10px;
   font-size: 14px;
 }
-.hint {
-  color: var(--text-dim);
-  font-size: 11px;
-  text-align: center;
-  margin-top: 6px;
-}
 
 /* 右栏报告面板 */
 .report-panel {
@@ -231,5 +395,115 @@ async function onRun() {
   font-weight: 600;
   color: var(--text-muted);
   margin-bottom: 12px;
+}
+
+/* 结果工具条 + 保存对话框 */
+.result-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.result-toolbar .ghost {
+  font-size: 12px;
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.result-toolbar .ghost:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.save-msg {
+  font-size: 12px;
+  color: var(--up);
+}
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  width: 380px;
+  max-width: 90vw;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.modal h3 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.modal-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.modal .field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.modal .field label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.modal .field input,
+.modal .field textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 7px 9px;
+  font-size: 13px;
+  color: var(--text);
+  font-family: inherit;
+  resize: vertical;
+}
+.modal .field textarea {
+  font-family: inherit;
+}
+.modal-summary {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  padding: 8px 10px;
+  background: var(--bg);
+  border-radius: var(--radius);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.modal-actions .ghost {
+  font-size: 13px;
+  padding: 7px 16px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.modal-actions .primary {
+  font-size: 13px;
+  padding: 7px 16px;
+  cursor: pointer;
+}
+.modal-actions .primary:disabled,
+.modal-actions .ghost:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 </style>

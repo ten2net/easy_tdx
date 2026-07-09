@@ -13,10 +13,21 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .._df import _apply_bar_time_align_df, _period_to_minutes, _to_df
-from .._reconnect import _RETRY_DELAYS, AsyncHeartbeatMixin
+from .._reconnect import (
+    _RETRY_DELAYS,
+    AsyncHeartbeatMixin,
+    select_best_host_async,
+    select_best_host_sync,
+)
 from ..codec.bitmap import Fields, PresetField
 from ..commands.base import BaseCommand
-from ..config import get_best_host, get_mac_hosts, get_port, get_timeout, save_best_host
+from ..config import (
+    get_best_mac_host,
+    get_mac_hosts,
+    get_port,
+    get_timeout,
+    save_best_mac_host,
+)
 from ..exceptions import TdxConnectionError
 from ..transport.async_ import AsyncTdxConnection
 from ..transport.sync import TdxConnection, ping_mac_all
@@ -147,12 +158,15 @@ class MacClient:
         auto_reconnect: bool = True,
         heartbeat_interval: float = 15.0,
     ) -> None:
-        self._host = host if host is not None else get_best_host()
+        self._host = host if host is not None else get_best_mac_host()
         self._port = port if port is not None else get_port()
         self._timeout = timeout if timeout is not None else get_timeout()
         self._auto_reconnect = auto_reconnect
         self._heartbeat_interval = heartbeat_interval
         self._conn = TdxConnection(self._host, self._port, self._timeout)
+        # XDXR（除权除息）记录缓存：(market, code) -> DataFrame。
+        # 仅在服务端 QFQ 返回异常（负价）时用于本地前复权重算。
+        self._xdxr_cache: dict[tuple[int, str], pd.DataFrame] = {}
 
     # ------------------------------------------------------------------ #
     # 工厂方法
@@ -177,7 +191,7 @@ class MacClient:
             timeout = get_timeout()
         ranked = ping_mac_all(hosts, port, ping_timeout)
         best = ranked[0][0] if ranked else hosts[0]
-        save_best_host(best)
+        save_best_mac_host(best)
         return cls(best, port, timeout, auto_reconnect, heartbeat_interval)
 
     @staticmethod
@@ -215,12 +229,23 @@ class MacClient:
         try:
             self._execute(KlineOffsetCmd(0, 1))
         except TdxConnectionError:
-            self._conn.stop_heartbeat()
-            self._conn.close()
-            self._conn = TdxConnection(self._host, self._port, self._timeout)
-            self._conn.connect()
-            if self._heartbeat_interval > 0:
-                self._conn.start_heartbeat(self._heartbeat_interval)
+            self._reconnect()
+
+    def _reconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        与 TdxClient._reconnect 对称：统一收敛 ``_execute`` 同主机重试、
+        跨主机故障转移、``ensure_connected`` 的重建副本。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        self._conn.stop_heartbeat()
+        self._conn.close()
+        self._conn = TdxConnection(target, self._port, self._timeout)
+        self._conn.connect()
+        if self._heartbeat_interval > 0:
+            self._conn.start_heartbeat(self._heartbeat_interval)
 
     def __enter__(self) -> MacClient:
         self.connect()
@@ -235,11 +260,15 @@ class MacClient:
         self.close()
 
     # ------------------------------------------------------------------ #
-    # 内部执行：含自动重连
+    # 内部执行：含自动重连 + 跨主机故障转移
     # ------------------------------------------------------------------ #
 
     def _execute(self, cmd: BaseCommand[_T]) -> _T:
-        """执行命令；断线时指数退避重试。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。
+
+        两阶段韧性与 TdxClient 对称：先同主机重试（``_RETRY_DELAYS``），
+        再跨主机故障转移（重新测速切到另一台 MAC 服务器）。
+        """
         try:
             return self._conn.execute(cmd)
         except TdxConnectionError:
@@ -248,11 +277,24 @@ class MacClient:
             last_exc: TdxConnectionError | None = None
             for delay in _RETRY_DELAYS:
                 time.sleep(delay)
-                self._conn.close()
-                self._conn = TdxConnection(self._host, self._port, self._timeout)
-                self._conn.connect()
-                if self._heartbeat_interval > 0:
-                    self._conn.start_heartbeat(self._heartbeat_interval)
+                self._reconnect()
+                try:
+                    return self._conn.execute(cmd)
+                except TdxConnectionError as e:
+                    last_exc = e
+            # 第二阶段：跨主机故障转移——测速切到另一台 MAC 服务器再试一次。
+            # save_best_mac_host（而非 save_best_host）：MAC 服务器写入独立的
+            # best_mac_host 配置项，不污染标准 best_host（v1.19.4 修复的回归）。
+            new_host = select_best_host_sync(
+                get_mac_hosts(),
+                ping_mac_all,
+                save_best_mac_host,
+                self._port,
+                5.0,
+                self._host,
+            )
+            if new_host is not None:
+                self._reconnect(new_host)
                 try:
                     return self._conn.execute(cmd)
                 except TdxConnectionError as e:
@@ -328,6 +370,107 @@ class MacClient:
         return _quotes_to_df(all_quotes)
 
     # ------------------------------------------------------------------ #
+    # QFQ 本地重算（服务端 QFQ 对深层历史返回负价时的兜底）
+    # ------------------------------------------------------------------ #
+
+    def _fetch_kline_pages(
+        self,
+        market: int,
+        code: str,
+        period: Period,
+        start: int,
+        count: int,
+        times: int,
+        fq: Adjust,
+    ) -> list[MacBar]:
+        """分页拉取指定复权类型的 K 线（返回 oldest→newest 的 MacBar 列表）。"""
+        all_bars: list[MacBar] = []
+        fetched = 0
+        offset = start
+        while fetched < count:
+            page_size = min(count - fetched, _KLINE_PAGE_SIZE)
+            bars = self._execute(
+                SymbolBarCmd(
+                    market=market,
+                    code=code,
+                    period=period,
+                    times=times,
+                    start=offset,
+                    count=page_size,
+                    fq=fq,
+                )
+            )
+            if not bars:
+                break
+            all_bars = bars + all_bars
+            fetched += len(bars)
+            offset += len(bars)
+            if len(bars) < page_size:
+                break
+        return all_bars
+
+    def _fetch_xdxr_records(self, market: int, code: str) -> pd.DataFrame | None:
+        """通过主协议客户端（TdxClient）拉取除权除息记录。
+
+        MAC 主机池不响应 XDXR（0x0c1f），需连 get_known_hosts 主机池。
+        结果按 (market, code) 缓存。失败返回 None（调用方降级）。
+        """
+        key = (market, code)
+        if key in self._xdxr_cache:
+            return self._xdxr_cache[key]
+        try:
+            # 函数内 import 避免循环依赖（client 依赖 mac，mac 不应依赖 client）
+            from .. import Market
+            from ..client import TdxClient
+
+            with TdxClient.from_best_host(timeout=self._timeout) as tc:
+                xd = tc.get_xdxr_info(Market(market), code)
+        except Exception as exc:  # noqa: BLE001 - 降级，不中断 kline 获取
+            _logger.warning(
+                "QFQ 本地重算：获取 %s %s XDXR 失败，降级返回服务端 QFQ：%s",
+                market,
+                code,
+                exc,
+            )
+            return None
+        if xd is None or xd.empty:
+            return None
+        self._xdxr_cache[key] = xd
+        return xd
+
+    def _local_recompute_qfq(
+        self,
+        df: pd.DataFrame,
+        market: int,
+        code: str,
+    ) -> pd.DataFrame:
+        """对 QFQ 异常的 K 线用 NONE + XDXR 本地重算前复权。
+
+        Args:
+            df: 服务端 QFQ 结果（含异常）。
+            market: 市场代码。
+            code: 股票代码。
+
+        Returns:
+            重算后的 DataFrame；XDXR 取不到或重算仍异常时原样返回 df。
+        """
+        from .adjust import apply_forward_adjust, has_bad_prices
+
+        xd = self._fetch_xdxr_records(market, code)
+        if xd is None:
+            return df
+        out = apply_forward_adjust(df, xd)
+        if has_bad_prices(out):
+            _logger.warning("QFQ 本地重算后 %s %s 仍含非法价格，降级返回服务端 QFQ", market, code)
+            return df
+        _logger.warning(
+            "QFQ 本地重算：%s %s 服务端深层历史返回负价，已用 NONE+XDXR 重算前复权",
+            market,
+            code,
+        )
+        return out
+
+    # ------------------------------------------------------------------ #
     # K 线（支持复权）
     # ------------------------------------------------------------------ #
 
@@ -358,32 +501,21 @@ class MacClient:
                 （= 开始 + 周期时长，与 Tushare/同花顺对齐，上午最后一根标 11:30）。
                 仅对分钟级周期生效；日线及以上不受影响。
         """
-        all_bars: list[MacBar] = []
-        fetched = 0
-        offset = start
-
-        while fetched < count:
-            page_size = min(count - fetched, _KLINE_PAGE_SIZE)
-            bars = self._execute(
-                SymbolBarCmd(
-                    market=market,
-                    code=code,
-                    period=period,
-                    times=times,
-                    start=offset,
-                    count=page_size,
-                    fq=adjust,
-                )
-            )
-            if not bars:
-                break
-            all_bars = bars + all_bars
-            fetched += len(bars)
-            offset += len(bars)
-            if len(bars) < page_size:
-                break
-
+        all_bars = self._fetch_kline_pages(market, code, period, start, count, times, adjust)
         df = _to_df(all_bars)
+
+        # QFQ 兜底：服务端对深层历史可能返回负价/零价，此时用 NONE+XDXR 本地重算。
+        if adjust == Adjust.QFQ and not df.empty:
+            from .adjust import has_bad_prices
+
+            if has_bad_prices(df):
+                none_bars = self._fetch_kline_pages(
+                    market, code, period, start, count, times, Adjust.NONE
+                )
+                df = _to_df(none_bars) if none_bars else df
+                if not df.empty:
+                    df = self._local_recompute_qfq(df, market, code)
+
         delta = _period_to_minutes(period, times)
         is_intraday = delta is not None
         return _apply_bar_time_align_df(
@@ -1063,7 +1195,7 @@ class AsyncMacClient(AsyncHeartbeatMixin):
         auto_reconnect: bool = True,
         heartbeat_interval: float = 15.0,
     ) -> None:
-        self._host = host if host is not None else get_best_host()
+        self._host = host if host is not None else get_best_mac_host()
         self._port = port if port is not None else get_port()
         self._timeout = timeout if timeout is not None else get_timeout()
         self._auto_reconnect = auto_reconnect
@@ -1071,6 +1203,9 @@ class AsyncMacClient(AsyncHeartbeatMixin):
         self._conn = AsyncTdxConnection(self._host, self._port, self._timeout)
         self._execute_lock = asyncio.Lock()
         self._heartbeat_task: asyncio.Task[None] | None = None
+        # XDXR（除权除息）记录缓存：(market, code) -> DataFrame。
+        # 仅在服务端 QFQ 返回异常（负价）时用于本地前复权重算。
+        self._xdxr_cache: dict[tuple[int, str], pd.DataFrame] = {}
 
     # ------------------------------------------------------------------ #
     # 工厂方法
@@ -1095,7 +1230,7 @@ class AsyncMacClient(AsyncHeartbeatMixin):
             timeout = get_timeout()
         ranked = ping_mac_all(hosts, port, ping_timeout)
         best = ranked[0][0] if ranked else hosts[0]
-        save_best_host(best)
+        save_best_mac_host(best)
         return cls(best, port, timeout, auto_reconnect, heartbeat_interval)
 
     @staticmethod
@@ -1132,11 +1267,22 @@ class AsyncMacClient(AsyncHeartbeatMixin):
         try:
             await self._execute(KlineOffsetCmd(0, 1))
         except TdxConnectionError:
-            await self._stop_heartbeat()
-            await self._conn.close()
-            self._conn = AsyncTdxConnection(self._host, self._port, self._timeout)
-            await self._conn.connect()
-            self._start_heartbeat()
+            await self._areconnect()
+
+    async def _areconnect(self, host: str | None = None) -> None:
+        """关闭当前连接并重建（默认连 self._host；传入 host 则切换主机）。
+
+        与 AsyncTdxClient._areconnect 对称。统一收敛 ``_execute`` 同主机重试、
+        跨主机故障转移、``ensure_connected`` 的重建副本。
+        """
+        target = host if host is not None else self._host
+        if host is not None:
+            self._host = host
+        await self._stop_heartbeat()
+        await self._conn.close()
+        self._conn = AsyncTdxConnection(target, self._port, self._timeout)
+        await self._conn.connect()
+        self._start_heartbeat()
 
     async def __aenter__(self) -> AsyncMacClient:
         await self.connect()
@@ -1163,7 +1309,7 @@ class AsyncMacClient(AsyncHeartbeatMixin):
     # ------------------------------------------------------------------ #
 
     async def _execute(self, cmd: BaseCommand[_T]) -> _T:
-        """执行命令；断线时指数退避重试。"""
+        """执行命令；断线时指数退避重试，同主机耗尽则跨主机故障转移。"""
         async with self._execute_lock:
             try:
                 return await self._conn.execute(cmd)
@@ -1173,9 +1319,24 @@ class AsyncMacClient(AsyncHeartbeatMixin):
                 last_exc: TdxConnectionError | None = None
                 for delay in _RETRY_DELAYS:
                     await asyncio.sleep(delay)
-                    await self._conn.close()
-                    self._conn = AsyncTdxConnection(self._host, self._port, self._timeout)
-                    await self._conn.connect()
+                    await self._areconnect()
+                    try:
+                        return await self._conn.execute(cmd)
+                    except TdxConnectionError as e:
+                        last_exc = e
+                # 第二阶段：跨主机故障转移
+                # save_best_mac_host：写入独立配置项，不污染标准 best_host
+                # （v1.19.4 修复的回归：MAC failover 不可用 save_best_host）
+                new_host = await select_best_host_async(
+                    get_mac_hosts(),
+                    ping_mac_all,
+                    save_best_mac_host,
+                    self._port,
+                    5.0,
+                    self._host,
+                )
+                if new_host is not None:
+                    await self._areconnect(new_host)
                     try:
                         return await self._conn.execute(cmd)
                     except TdxConnectionError as e:
@@ -1234,6 +1395,58 @@ class AsyncMacClient(AsyncHeartbeatMixin):
         return _quotes_to_df(all_quotes)
 
     # ------------------------------------------------------------------ #
+    # QFQ 本地重算（服务端 QFQ 对深层历史返回负价时的兜底）
+    # 同步方法：XDXR 经 TdxClient（同步主协议）获取，由 asyncio.to_thread 调用。
+    # ------------------------------------------------------------------ #
+
+    def _fetch_xdxr_records(self, market: int, code: str) -> pd.DataFrame | None:
+        """通过主协议客户端（TdxClient）拉取除权除息记录（同 MacClient）。"""
+        key = (market, code)
+        if key in self._xdxr_cache:
+            return self._xdxr_cache[key]
+        try:
+            from .. import Market
+            from ..client import TdxClient
+
+            with TdxClient.from_best_host(timeout=self._timeout) as tc:
+                xd = tc.get_xdxr_info(Market(market), code)
+        except Exception as exc:  # noqa: BLE001 - 降级，不中断 kline 获取
+            _logger.warning(
+                "QFQ 本地重算：获取 %s %s XDXR 失败，降级返回服务端 QFQ：%s",
+                market,
+                code,
+                exc,
+            )
+            return None
+        if xd is None or xd.empty:
+            return None
+        self._xdxr_cache[key] = xd
+        return xd
+
+    def _local_recompute_qfq(
+        self,
+        df: pd.DataFrame,
+        market: int,
+        code: str,
+    ) -> pd.DataFrame:
+        """对 QFQ 异常的 K 线用 NONE+XDXR 本地重算前复权（同 MacClient）。"""
+        from .adjust import apply_forward_adjust, has_bad_prices
+
+        xd = self._fetch_xdxr_records(market, code)
+        if xd is None:
+            return df
+        out = apply_forward_adjust(df, xd)
+        if has_bad_prices(out):
+            _logger.warning("QFQ 本地重算后 %s %s 仍含非法价格，降级返回服务端 QFQ", market, code)
+            return df
+        _logger.warning(
+            "QFQ 本地重算：%s %s 服务端深层历史返回负价，已用 NONE+XDXR 重算前复权",
+            market,
+            code,
+        )
+        return out
+
+    # ------------------------------------------------------------------ #
     # K 线
     # ------------------------------------------------------------------ #
 
@@ -1276,6 +1489,45 @@ class AsyncMacClient(AsyncHeartbeatMixin):
                 break
 
         df = _to_df(all_bars)
+
+        # QFQ 兜底：服务端对深层历史可能返回负价/零价，此时用 NONE+XDXR 本地重算。
+        if adjust == Adjust.QFQ and not df.empty:
+            from .adjust import has_bad_prices
+
+            if has_bad_prices(df):
+                # 异步重抓 NONE
+                none_bars: list[MacBar] = []
+                nfetched = 0
+                noffset = start
+                while nfetched < count:
+                    nps = min(count - nfetched, _KLINE_PAGE_SIZE)
+                    nb = await self._execute(
+                        SymbolBarCmd(
+                            market=market,
+                            code=code,
+                            period=period,
+                            times=times,
+                            start=noffset,
+                            count=nps,
+                            fq=Adjust.NONE,
+                        )
+                    )
+                    if not nb:
+                        break
+                    none_bars = nb + none_bars
+                    nfetched += len(nb)
+                    noffset += len(nb)
+                    if len(nb) < nps:
+                        break
+                if none_bars:
+                    # XDXR 获取涉及同步网络 IO，放线程执行
+                    df = await asyncio.to_thread(
+                        self._local_recompute_qfq,
+                        _to_df(none_bars),
+                        market,
+                        code,
+                    )
+
         delta = _period_to_minutes(period, times)
         is_intraday = delta is not None
         return _apply_bar_time_align_df(
